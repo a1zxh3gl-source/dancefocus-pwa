@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#08070d" />
+    <meta name="description" content="在 iPhone 本地把多人舞蹈课堂视频制作成专属直拍，不上传视频。" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="舞焦" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="format-detection" content="telephone=no" />
+    <title>舞焦 DanceFocus</title>
+    <link rel="manifest" href="./manifest.webmanifest?v=20260813-1" />
+    <link rel="icon" type="image/png" sizes="192x192" href="./icons/icon-192.png?v=20260813-1" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon.png?v=20260813-1" />
+    <link rel="stylesheet" href="./styles.css?v=20260813-18" />
+  </head>
+  <body>
+    <main class="app-shell" aria-live="polite">
+      <!-- 1. 首页：只负责选择视频 -->
+      <section class="screen active home-screen" data-page="1" aria-label="选择视频">
+        <header class="app-header home-header"><div class="mini-logo">◇</div><button class="icon-button" id="privacyButton" aria-label="本地隐私说明">◉</button></header>
+        <div class="home-hero">
+          <div class="focus-logo" aria-hidden="true"><span>✦</span></div>
+          <h1>DanceFocus</h1>
+          <p>制作你的专属舞蹈直拍</p>
+        </div>
+        <button class="import-button" id="importButton">
+          <span>＋</span><b>选择课堂视频</b><small>仅在这台设备上处理</small>
+        </button>
+        <input id="videoPicker" type="file" accept="video/mp4,video/quicktime,video/*" hidden />
+        <div class="privacy-line"><i></i><span>不上传、不需要服务器、不保存历史视频</span></div>
+      </section>
+
+      <!-- 2. 裁剪首尾 -->
+      <section class="screen" data-page="2" aria-label="修剪视频">
+        <header class="app-header"><button class="back-button" data-back aria-label="返回">‹</button><b>修剪视频</b><span class="step-pill">1 / 4</span></header>
+        <div class="tip-bubble"><span class="tip-icon">✂</span><div><b>修剪视频时长</b><small>去掉首尾多余画面，跟踪会更稳定</small></div></div>
+        <div class="trim-preview video-stage"><video id="trimVideo" data-source-video playsinline preload="metadata"></video><button class="round-play" id="trimPlay">▶</button><div class="video-opening hidden" id="videoOpening"><span></span><b>正在从手机读取视频…</b><small>大视频可能需要等待几秒，请不要离开页面</small></div></div>
+        <div class="trim-readout"><span id="trimRangeText">00:00.00 — 00:00.00</span><b id="trimLengthText">0.00s</b></div>
+        <div class="filmstrip" id="filmstrip"><div class="trim-mask trim-mask-left" id="trimMaskLeft"></div><div class="trim-mask trim-mask-right" id="trimMaskRight"></div><i class="trim-line" id="trimLine"></i></div>
+        <label class="range-row"><span>开始</span><input id="trimStart" type="range" min="0" max="0" step="0.04" value="0" /><output id="trimStartText">00:00.00</output></label>
+        <label class="range-row"><span>结束</span><input id="trimEnd" type="range" min="0" max="0" step="0.04" value="0" /><output id="trimEndText">00:00.00</output></label>
+        <button class="primary-button bottom-cta" id="trimContinue">继续</button>
+      </section>
+
+      <!-- 3. 真实多人框，点选后才能开始 -->
+      <section class="screen" data-page="3" aria-label="选择跟踪人物">
+        <header class="app-header"><button class="back-button" data-back aria-label="返回">‹</button><b>选择你自己</b><span class="step-pill">2 / 4</span></header>
+        <div class="selection-status" id="selectionStatus"><span class="status-dot loading"></span><div><b>正在识别每位人物…</b><small>识别完成后，点击你的人物框</small></div></div>
+        <div class="detect-stage video-stage" id="selectStage">
+          <video id="selectVideo" data-source-video playsinline preload="none"></video>
+          <div class="box-layer" id="selectBoxes"></div>
+          <div class="model-loader" id="modelLoader"><span></span><b>本地 AI 模型准备中</b><small>第一次打开可能需要几秒</small></div>
+        </div>
+        <div class="frame-time"><b id="selectTimeText">00:00.00</b><span>/ <span id="selectDurationText">00:00.00</span></span><small>没看到你？向后找有框的一帧</small></div>
+        <input class="native-scrubber" id="selectScrubber" type="range" min="0" max="0" step="0.04" value="0" />
+        <div class="frame-actions compact"><button id="selectPrevFrame">◀ 上一帧</button><button id="selectNextFrame">下一帧 ▶</button><button id="redetectButton">↻ 重新识别</button></div>
+        <button class="primary-button bottom-cta" id="startTracking" disabled>请先选择人物</button>
+        <button class="secondary-button original-video-button" id="editOriginalVideo">不跟踪人物，直接编辑原视频</button>
+      </section>
+
+      <!-- 4. 跟踪计算 -->
+      <section class="screen analysis-screen" data-page="4" aria-label="正在跟踪">
+        <header class="app-header"><button class="back-button" data-cancel-analysis aria-label="取消">‹</button><b>识别跟踪</b><span class="step-pill">3 / 4</span></header>
+        <div class="analysis-wrap">
+          <div class="progress-ring" id="progressRing" style="--progress:0"><span><b id="analysisPercent">0%</b><small>本地处理</small></span></div>
+          <h2>正在跟踪所选人物…</h2>
+          <p id="analysisText">正在逐帧区分画面中的每位人物</p>
+          <div class="analysis-strip"><span id="analysisGreen"></span><i id="analysisHead"></i></div>
+          <small class="analysis-note">请保持页面在前台。视频越长，本地识别时间越长。</small>
+        </div>
+      </section>
+
+      <!-- 5. 中断修正 / 完成 -->
+      <section class="screen edit-screen" data-page="5" aria-label="编辑跟踪">
+        <header class="app-header"><button class="back-button" data-back aria-label="返回">‹</button><b>编辑跟踪</b><button class="preview-link" id="previewButton">预览成片 ›</button></header>
+        <div class="result-bubble warning" id="resultBubble"><span id="resultIcon">!</span><div><b id="resultTitle">自动跟踪停止了</b><small id="resultMessage">点“下一帧”或拖动进度条向后找框，再点选同一人</small></div></div>
+        <div class="edit-video video-stage" id="editStage">
+          <video id="editVideo" data-source-video playsinline preload="none"></video>
+          <div class="box-layer" id="editBoxes"></div>
+          <button class="round-play" id="editPlay">▶</button>
+        </div>
+        <div class="timeline-heading"><div><b id="editCurrentText">00:00.00</b><span>/ <span id="editDurationText">00:00.00</span></span></div><small id="editHint">下一帧：逐帧精准找框</small></div>
+        <div class="track-timeline" id="trackTimeline" role="slider" tabindex="0" aria-label="跟踪进度"><div class="timeline-base"></div><div id="trackSegments"></div><i class="timeline-head" id="timelineHead"></i></div>
+        <div class="timeline-legend"><span><i class="green"></i>跟踪到你</span><span><i class="gray"></i>未跟踪 / 手动跳过</span></div>
+        <div class="frame-actions edit-frame-actions"><button id="editPrevFrame">◀ 上一帧</button><button id="editNextFrame">下一帧 ▶</button><button id="detectCurrentFrame">◎ 找人物框</button><button class="reset-track-button" id="resetTracking">↻ 重置</button></div>
+        <button class="secondary-button" id="skipToHere" disabled>将中断点到当前帧设为灰色</button>
+      </section>
+
+      <!-- 6. 成片预览：画幅 / 放大 / 他人打码 -->
+      <section class="screen preview-screen" data-page="6" aria-label="预览成片">
+        <header class="app-header"><button class="back-button" data-back aria-label="返回">‹</button><b>预览成片</b><button class="export-button" id="exportButton">导出</button></header>
+        <div class="preview-workspace">
+          <div class="render-frame ratio-9-16" id="renderFrame"><canvas id="previewCanvas"></canvas><video id="previewVideo" class="preview-decode-video" data-source-video muted playsinline preload="none"></video><span class="ratio-badge" id="ratioBadge">9:16</span></div>
+          <button class="preview-play-control" id="previewPlay" aria-label="播放预览"><span>▶</span><b>播放预览</b></button>
+          <div class="preview-time"><b id="previewTime">00:00.00</b><span>/ <span id="previewDurationText">00:00.00</span></span></div>
+          <input class="native-scrubber" id="previewScrubber" type="range" min="0" max="0" step="0.04" value="0" />
+          <div class="extracted-audio-timeline" id="extractedAudioTimeline" hidden>
+            <div class="audio-track-heading"><span>♫ 提取音乐</span><b id="audioTrackPosition">自动对齐中…</b></div>
+            <div class="audio-track-lane" id="audioTrackLane">
+              <div class="audio-track-clip" id="extractedAudioTrack" role="slider" tabindex="0" aria-label="拖动调整音乐位置">
+                <canvas id="audioTrackWaveform" width="900" height="82"></canvas><span>拖动音轨对齐</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="editor-tabs" role="tablist">
+          <button class="active" data-editor-tab="ratio"><span>▯</span>画幅</button>
+          <button data-editor-tab="zoom" data-tracking-only><span>⌕</span>人物放大<small>仅限人物跟踪</small></button>
+          <button data-editor-tab="blur" data-tracking-only><span>▦</span>他人打码<small>仅限人物跟踪</small></button>
+          <button data-editor-tab="audio"><span>♫</span>配音</button>
+        </div>
+        <section class="control-sheet active" data-editor-panel="ratio">
+          <div class="sheet-heading"><div><b>画幅比例</b><small>选择成片页面比例</small></div><span id="ratioValue">9:16</span></div>
+          <div class="option-grid" id="ratioOptions">
+            <button class="selected" data-ratio="9:16" data-class="ratio-9-16">9:16</button><button data-ratio="2:3" data-class="ratio-2-3">2:3</button><button data-ratio="3:4" data-class="ratio-3-4">3:4</button>
+            <button data-ratio="1:1" data-class="ratio-1-1">1:1</button><button data-ratio="4:3" data-class="ratio-4-3">4:3</button><button data-ratio="16:9" data-class="ratio-16-9">16:9</button>
+          </div>
+        </section>
+        <section class="control-sheet" data-editor-panel="zoom">
+          <div class="sheet-heading"><div><b>人物放大</b><small>人物越大，画面裁剪越多</small></div><span id="zoomValue">180%</span></div>
+          <div class="option-grid" id="zoomOptions"><button data-zoom="100">100%</button><button data-zoom="120">120%</button><button data-zoom="140">140%</button><button data-zoom="160">160%</button><button class="selected" data-zoom="180">180%</button><button data-zoom="200">200%</button><button data-zoom="240">240%</button><button data-zoom="280">280%</button></div>
+          <input class="wide-range" id="zoomSlider" type="range" min="100" max="280" step="20" value="180" />
+        </section>
+        <section class="control-sheet" data-editor-panel="blur">
+          <div class="sheet-heading"><div><b>自动给他人打码</b><small>保留你，按其他人的完整人体轮廓打码</small></div><span id="blurValue">已关闭</span></div>
+          <button class="toggle-row" id="blurToggle" aria-pressed="false"><i></i><span><b>人体轮廓匿名</b><small>保护目标人物，其他人按像素级轮廓处理</small></span></button>
+          <div class="blur-effect-options" aria-label="匿名效果">
+            <button class="selected" data-blur-effect="mosaic">马赛克</button>
+            <button data-blur-effect="gaussian">高斯模糊</button>
+            <button data-blur-effect="silhouette">纯色剪影</button>
+          </div>
+          <label class="blur-range"><span>效果强度 <output id="blurStrengthValue">18</output></span><input id="blurStrength" type="range" min="8" max="36" step="2" value="18" /></label>
+          <label class="blur-range"><span>轮廓扩张 <output id="maskDilationValue">5</output></span><input id="maskDilation" type="range" min="0" max="12" step="1" value="5" /></label>
+          <label class="blur-range"><span>边缘羽化 <output id="maskFeatherValue">3</output></span><input id="maskFeather" type="range" min="0" max="8" step="1" value="3" /></label>
+        </section>
+        <section class="control-sheet audio-sheet" data-editor-panel="audio">
+          <div class="sheet-heading"><div><b>提取音乐</b><small>从另一个视频中提取音频，自动放到对应时间位置</small></div><span id="audioMatchBadge">未提取</span></div>
+          <input id="referenceAudioPicker" type="file" accept="video/mp4,video/quicktime,video/*" hidden />
+          <button class="audio-upload-button" id="referenceAudioButton"><span>♫</span><div><b>选择视频并提取音乐</b><small id="referenceAudioName">选择含有干净音乐的视频</small></div></button>
+          <div class="audio-analysis-status" id="audioAnalysisStatus" hidden>
+            <div><b id="audioAnalysisText">正在提取并对齐…</b><span id="audioAnalysisPercent">0%</span></div>
+            <i><span id="audioAnalysisProgress"></span></i>
+          </div>
+          <div class="audio-result" id="audioResult" hidden>
+            <p class="audio-drag-tip">已放到视频进度条下方，按住粉色音轨左右拖动即可手动对齐。</p>
+            <label class="audio-volume-row" id="originalVolumeRow"><span>现场原声 <output id="originalVolumeValue">0%</output></span><input id="originalVolume" type="range" min="0" max="100" step="1" value="0" /></label>
+            <label class="audio-volume-row"><span>提取音乐 <output id="musicVolumeValue">100%</output></span><input id="musicVolume" type="range" min="0" max="150" step="1" value="100" /></label>
+            <button class="remove-audio-button" id="removeReferenceAudio">移除提取音乐</button>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" role="status"></div>
+    <script src="./vendor/tf.min.js?v=20260813-13"></script>
+    <script src="./vendor/coco-ssd.min.js?v=20260813-13"></script>
+    <script src="./vendor/ffmpeg/ffmpeg.js?v=20260813-13"></script>
+    <script src="./mask-config.js?v=20260813-18"></script>
+    <script src="./mask-compositor.js?v=20260813-18"></script>
+    <script src="./tracking-engine.js?v=20260813-18"></script>
+    <script src="./audio/audio-alignment-core.js?v=20260813-13"></script>
+    <script src="./audio/reference-music-engine.js?v=20260813-13"></script>
+    <script src="./app.js?v=20260813-18"></script>
+    <script src="./pwa.js?v=20260813-1"></script>
+  </body>
+</html>
