@@ -141,6 +141,7 @@
       this.musicVolume = 1;
       this.alignedPreviewBuffer = null;
       this.audioContext = null;
+      this.playbackContextInvalidated = false;
       this.previewSource = null;
       this.previewGain = null;
       this.previewStartedAt = 0;
@@ -178,6 +179,74 @@
         else buffer.getChannelData(index).set(samples);
       });
       return buffer;
+    }
+
+    snapshotAudioBuffer(buffer) {
+      if (!buffer?.length || !buffer?.numberOfChannels) return null;
+      return {
+        sampleRate: buffer.sampleRate,
+        channels: Array.from({ length: buffer.numberOfChannels }, (_, index) => buffer.getChannelData(index).slice()),
+      };
+    }
+
+    audioBufferFromSnapshot(snapshot, context) {
+      if (!snapshot?.channels?.length || !snapshot.channels[0]?.length) return null;
+      const buffer = context.createBuffer(snapshot.channels.length, snapshot.channels[0].length, snapshot.sampleRate);
+      snapshot.channels.forEach((samples, index) => {
+        if (typeof buffer.copyToChannel === "function") buffer.copyToChannel(samples, index);
+        else buffer.getChannelData(index).set(samples);
+      });
+      return buffer;
+    }
+
+    unlockAudioContext(context) {
+      if (!context || context.state !== "running") return;
+      // iOS 关闭系统“存储视频”面板后，AudioContext 可能显示为
+      // running 却没有重新打开输出通道。在用户点击播放的手势内送出
+      // 一个无法听见的单采样节点，让 Safari 重新激活音频会话。
+      const buffer = context.createBuffer(1, 1, context.sampleRate);
+      buffer.getChannelData(0)[0] = 0.000001;
+      const source = context.createBufferSource();
+      source.buffer = buffer;
+      source.connect(context.destination);
+      source.start(0);
+    }
+
+    markSystemAudioInterrupted() {
+      if (!this.audioContext) return;
+      this.playbackContextInvalidated = true;
+      this.stopPreview();
+    }
+
+    async resumePreviewContext() {
+      let context = this.ensureAudioContext();
+      if (!this.playbackContextInvalidated) {
+        try { await context.resume(); } catch (_) { /* iOS interrupted 时改为重建 */ }
+        if (context.state === "running") {
+          this.unlockAudioContext(context);
+          return context;
+        }
+      }
+
+      // iOS 从系统分享/存储视频界面返回后，旧 AudioContext 有时仍报告
+      // running，但实际输出通道已经失效。复制缓冲并重建 Context 才能恢复。
+      const alignedSnapshot = this.snapshotAudioBuffer(this.alignedPreviewBuffer);
+      const referenceWasAligned = this.referenceDecodedBuffer === this.alignedPreviewBuffer;
+      this.stopPreview();
+      try { await context.close(); } catch (_) { /* 已关闭或 interrupted */ }
+      const AudioContextClass = global.AudioContext || global.webkitAudioContext;
+      if (!AudioContextClass) throw new Error("当前浏览器无法恢复音频播放");
+      context = new AudioContextClass();
+      this.audioContext = context;
+      if (alignedSnapshot) {
+        this.alignedPreviewBuffer = this.audioBufferFromSnapshot(alignedSnapshot, context);
+        if (referenceWasAligned) this.referenceDecodedBuffer = this.alignedPreviewBuffer;
+      }
+      this.playbackContextInvalidated = false;
+      await context.resume();
+      if (context.state !== "running") throw new Error("系统音频会话尚未恢复");
+      this.unlockAudioContext(context);
+      return context;
     }
 
     emit(stage, progress, message) {
@@ -623,13 +692,13 @@
     }
 
     async startPreview(video, trimStart) {
-      if (!this.alignedPreviewBuffer || !this.audioContext) {
+      if (!this.alignedPreviewBuffer) {
         this.applyVideoVolume(video, trimStart);
         return;
       }
       const requestId = ++this.previewRequestId;
       this.stopPreview(false);
-      await this.audioContext.resume();
+      await this.resumePreviewContext();
       // seeked、play 与手动拖动在 iPhone 上可能同时触发。旧的异步启动
       // 不得覆盖最新的视频位置，否则会听到错位或双音轨。
       if (requestId !== this.previewRequestId || video.paused || video.seeking) return;
@@ -886,6 +955,7 @@
       this.referencePreviewSampleRate = this.sampleRate;
       this.previewQuality = "analysis";
       this.previewUsesRawReference = false;
+      this.playbackContextInvalidated = false;
       this.mode = "replace";
       this.originalVolume = 0;
       this.musicVolume = 1;
@@ -896,6 +966,7 @@
       if (this.audioContext) await this.audioContext.close().catch(() => {});
       if (this.ffmpeg) this.ffmpeg.terminate();
       this.audioContext = null;
+      this.playbackContextInvalidated = false;
       this.ffmpeg = null;
       this.ffmpegPromise = null;
     }

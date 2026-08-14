@@ -2044,9 +2044,17 @@ $("#previewPlay").addEventListener("click", async () => {
   if (video.paused) {
     // 从 iPhone 系统“存储视频”界面返回后 Web Audio 会进入 suspended。
     // 必须在这次用户点击的手势内先恢复，否则后面等首帧时会丢失播放权限。
-    await state.musicEngine?.audioContext?.resume?.().catch(() => {});
+    let cleanAudioReady = true;
+    if (state.musicEngine?.confirmed) {
+      try {
+        await state.musicEngine.resumePreviewContext();
+      } catch (error) {
+        console.warn("系统音频会话恢复失败，先回退到视频原声", error);
+        cleanAudioReady = false;
+      }
+    }
     if (video.currentTime < state.trimStart || video.currentTime >= state.trimEnd) video.currentTime = state.trimStart;
-    if (state.musicEngine?.result) state.musicEngine.applyVideoVolume(video, state.trimStart);
+    if (state.musicEngine?.result && cleanAudioReady) state.musicEngine.applyVideoVolume(video, state.trimStart);
     else { video.muted = false; video.volume = 1; }
     try {
       if (state.blurOthers && !state.previewMasksReady) {
@@ -2056,7 +2064,18 @@ $("#previewPlay").addEventListener("click", async () => {
       // iPhone 的 play() Promise 可能早于首个画面帧真正呈现。
       // 等视频时钟开始走动后再启动配乐，避免手机端音乐抢跑。
       await waitForPresentedVideoFrame(video);
-      if (!video.paused && state.musicEngine?.confirmed) await state.musicEngine.startPreview(video, state.trimStart);
+      if (!video.paused && state.musicEngine?.confirmed && cleanAudioReady) {
+        try {
+          await state.musicEngine.startPreview(video, state.trimStart);
+        } catch (error) {
+          console.warn("配乐预览恢复失败，本次播放视频原声", error);
+          video.muted = false;
+          video.volume = 1;
+          showToast("系统音频刚恢复，本次先播放视频原声，再点一次即可恢复配乐", 4200);
+        }
+      } else if (!cleanAudioReady) {
+        showToast("系统音频刚恢复，本次先播放视频原声，再点一次即可恢复配乐", 4200);
+      }
     } catch (_) { showToast("请再点一次播放"); }
   } else {
     video.pause();
@@ -2161,7 +2180,14 @@ $("#saveExportedVideo").addEventListener("click", async () => {
   if (!file) return;
   try {
     if (navigator.canShare?.({ files: [file] })) {
-      await navigator.share({ files: [file], title: "DanceFocus 直拍视频" });
+      state.musicEngine?.markSystemAudioInterrupted?.();
+      try {
+        await navigator.share({ files: [file], title: "DanceFocus 直拍视频" });
+      } finally {
+        // iOS 关闭分享面板时可能仍报告 AudioContext=running，但实际输出
+        // 已失效。下次点播放必须强制重建，不能只调用 resume()。
+        state.musicEngine?.markSystemAudioInterrupted?.();
+      }
     } else {
       downloadExportedFile(file);
     }
@@ -2309,4 +2335,8 @@ showPage(1, false);
 // PWA 层通过事件复用现有 Toast，不需要访问或复制编辑器内部状态。
 window.addEventListener("dancefocus:pwa-status", (event) => {
   if (event.detail?.message) showToast(event.detail.message, event.detail.duration || 3600);
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) state.musicEngine?.markSystemAudioInterrupted?.();
 });
