@@ -29,8 +29,16 @@
       const length = view.getUint32(cursor + 4, true);
       const payload = cursor + 8;
       if (id === "fmt ") {
+        const rawCode = view.getUint16(payload, true);
+        // WAVE_FORMAT_EXTENSIBLE(0xfffe) 会把真正的 PCM/Float 类型放在
+        // SubFormat GUID 的前两字节。如果把 32-bit float 当成 int32 读，
+        // 就会出现整段“磁磁啦啦”的失真。
+        const code = rawCode === 0xfffe && length >= 40
+          ? view.getUint16(payload + 24, true)
+          : rawCode;
         format = {
-          code: view.getUint16(payload, true),
+          code,
+          rawCode,
           channels: view.getUint16(payload + 2, true),
           sampleRate: view.getUint32(payload + 4, true),
           bits: view.getUint16(payload + 14, true),
@@ -58,7 +66,9 @@
           value = integer / 8388608;
         } else if (format.bits === 32) value = view.getInt32(offset, true) / 2147483648;
         else if (format.bits === 8) value = (view.getUint8(offset) - 128) / 128;
-        channels[channel][frame] = clamp(value, -1, 1);
+        // 个别手机解码器会在损坏包或非标准 WAV 块附近产生 NaN/Infinity。
+        // Web Audio 遇到非有限样本时可能输出刺耳爆音，因此写入前必须清洗。
+        channels[channel][frame] = Number.isFinite(value) ? clamp(value, -1, 1) : 0;
       }
     }
     const mono = channels.length === 1 ? channels[0] : new Float32Array(frameCount);
@@ -103,6 +113,9 @@
       this.previewPlaybackRate = 1;
       this.previewUsesRawReference = false;
       this.previewBoundaryTimer = null;
+      this.previewLastSyncAt = 0;
+      this.previewResyncThreshold = clamp(safeNumber(options.previewResyncThreshold, .35), .18, 1);
+      this.previewResyncCooldownMs = Math.max(300, safeNumber(options.previewResyncCooldownMs, 900));
       this.referenceDecodedBuffer = null;
       this.referencePreviewPcm = null;
       this.processing = false;
@@ -511,21 +524,26 @@
       // Web Audio 兼容预览只在 FFmpeg 无法运行时启用；极小的漂移在这里用 playbackRate 跟随，
       // 正式导出仍由 FFmpeg atempo 保持音调。
       source.playbackRate.value = this.previewUsesRawReference ? speed : 1;
-      gain.gain.value = this.musicVolume;
       source.connect(gain);
       gain.connect(this.audioContext.destination);
       const sourceOffset = Math.max(0, musicTime);
       const delay = this.previewUsesRawReference && relativeTime < trackStart ? trackStart - relativeTime : 0;
+      const startAt = this.audioContext.currentTime + delay;
+      // iOS 上直接在非零波形位置启动/重定位 AudioBufferSourceNode
+      // 会产生连续“咔哒”声。每次启动用 25ms 短淡入消除波形跳变。
+      gain.gain.setValueAtTime(0, startAt);
+      gain.gain.linearRampToValueAtTime(this.musicVolume, startAt + .025);
       // AudioBufferSourceNode.start 的第一个参数是 AudioContext 的“绝对时间”，不是延迟秒数。
       // 之前直接传 3.509，当 AudioContext.currentTime 已超过 3.509 时会被当成“立即播放”。
       // 现在从当前音频时钟往后排程，所以视频 0–3.509 秒保持无提取音乐。
-      source.start(this.audioContext.currentTime + delay, sourceOffset);
+      source.start(startAt, sourceOffset);
       this.previewSource = source;
       this.previewGain = gain;
       this.previewStartedAt = this.audioContext.currentTime;
       this.previewVideoTime = relativeTime;
       this.previewMusicTime = musicTime;
       this.previewPlaybackRate = source.playbackRate.value;
+      this.previewLastSyncAt = global.performance?.now?.() || Date.now();
       this.applyVideoVolume(video, trimStart);
       const coverage = this.audioCoverageSeconds();
       if (coverage) {
@@ -552,8 +570,26 @@
       if (this.previewBoundaryTimer) global.clearTimeout(this.previewBoundaryTimer);
       this.previewBoundaryTimer = null;
       if (this.previewSource) {
-        try { this.previewSource.stop(); } catch (_) { /* 已停止 */ }
-        try { this.previewSource.disconnect(); } catch (_) { /* 已断开 */ }
+        const source = this.previewSource;
+        const gain = this.previewGain;
+        const context = this.audioContext;
+        if (gain && context?.state === "running") {
+          // 还在播放时用 20ms 淡出，避免拖动进度条或自动校时时爆音。
+          const now = context.currentTime;
+          const currentGain = clamp(safeNumber(gain.gain.value, this.musicVolume), 0, 1.5);
+          gain.gain.cancelScheduledValues(now);
+          gain.gain.setValueAtTime(currentGain, now);
+          gain.gain.linearRampToValueAtTime(0, now + .018);
+          try { source.stop(now + .022); } catch (_) { /* 已停止 */ }
+          global.setTimeout(() => {
+            try { source.disconnect(); } catch (_) { /* 已断开 */ }
+            try { gain.disconnect(); } catch (_) { /* 已断开 */ }
+          }, 40);
+        } else {
+          try { source.stop(); } catch (_) { /* 已停止 */ }
+          try { source.disconnect(); } catch (_) { /* 已断开 */ }
+          try { gain?.disconnect(); } catch (_) { /* 已断开 */ }
+        }
       }
       this.previewSource = null;
       this.previewGain = null;
@@ -563,7 +599,15 @@
       if (!this.alignedPreviewBuffer || video.paused || video.seeking) return;
       const expected = video.currentTime - trimStart;
       const actual = this.previewVideoTime + (this.audioContext.currentTime - this.previewStartedAt);
-      if (force || Math.abs(expected - actual) > .12) await this.startPreview(video, trimStart);
+      const now = global.performance?.now?.() || Date.now();
+      const drift = Math.abs(expected - actual);
+      // iOS timeupdate 时间粒度较粗，旧的 120ms 阈值会在正常播放时反复
+      // stop/start 音源，听起来像音轨损坏。改为容差+冷却，真正拖动仍可强制校时。
+      if (force && now - this.previewLastSyncAt < 80) return;
+      if (force || (drift > this.previewResyncThreshold && now - this.previewLastSyncAt >= this.previewResyncCooldownMs)) {
+        this.previewLastSyncAt = now;
+        await this.startPreview(video, trimStart);
+      }
     }
 
     exportParameters() {
