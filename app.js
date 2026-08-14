@@ -2009,23 +2009,42 @@ function previewLoop() {
 }
 
 async function waitForPresentedVideoFrame(video, timeoutMs = 420) {
-  if (!video || video.paused || typeof video.requestVideoFrameCallback !== "function") return;
+  if (!video || video.paused) return;
   await new Promise((resolve) => {
     let settled = false;
+    let animationFrame = 0;
+    const initialTime = video.currentTime;
     const finish = () => {
       if (settled) return;
       settled = true;
       window.clearTimeout(timer);
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      video.removeEventListener("timeupdate", checkFallback);
       resolve();
     };
+    const checkFallback = () => {
+      if (video.readyState >= 2 && video.currentTime > initialTime + .002) {
+        finish();
+        return;
+      }
+      animationFrame = window.requestAnimationFrame(checkFallback);
+    };
     const timer = window.setTimeout(finish, timeoutMs);
-    video.requestVideoFrameCallback(finish);
+    if (typeof video.requestVideoFrameCallback === "function") {
+      video.requestVideoFrameCallback(finish);
+    } else {
+      video.addEventListener("timeupdate", checkFallback);
+      animationFrame = window.requestAnimationFrame(checkFallback);
+    }
   });
 }
 
 $("#previewPlay").addEventListener("click", async () => {
   const video = $("#previewVideo");
   if (video.paused) {
+    // 从 iPhone 系统“存储视频”界面返回后 Web Audio 会进入 suspended。
+    // 必须在这次用户点击的手势内先恢复，否则后面等首帧时会丢失播放权限。
+    await state.musicEngine?.audioContext?.resume?.().catch(() => {});
     if (video.currentTime < state.trimStart || video.currentTime >= state.trimEnd) video.currentTime = state.trimStart;
     if (state.musicEngine?.result) state.musicEngine.applyVideoVolume(video, state.trimStart);
     else { video.muted = false; video.volume = 1; }
@@ -2097,35 +2116,6 @@ $("#previewScrubber").addEventListener("change", async () => {
 });
 
 $("#exportButton").addEventListener("click", exportLocalVideo);
-let previewAudioCapture = null;
-async function addVideoAudioToStream(video, canvasStream) {
-  // 优先用 Web Audio 把原音轨送入编码流，并通过 0 音量节点连接系统输出。
-  // 导出仍会后台解码视频，但不会让用户听到预览自动播放。
-  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-  if (AudioContextClass) {
-    if (!previewAudioCapture) {
-      const context = new AudioContextClass();
-      const source = context.createMediaElementSource(video);
-      const destination = context.createMediaStreamDestination();
-      const monitorGain = context.createGain();
-      monitorGain.gain.value = 0;
-      source.connect(destination);
-      source.connect(monitorGain);
-      monitorGain.connect(context.destination);
-      previewAudioCapture = { context, source, destination, monitorGain };
-    }
-    previewAudioCapture.monitorGain.gain.value = 0;
-    await previewAudioCapture.context.resume();
-    previewAudioCapture.destination.stream.getAudioTracks().forEach((track) => canvasStream.addTrack(track));
-    return;
-  }
-  const capture = video.captureStream || video.webkitCaptureStream;
-  if (typeof capture === "function") {
-    const sourceStream = capture.call(video);
-    sourceStream.getAudioTracks().forEach((track) => canvasStream.addTrack(track));
-  }
-}
-
 function setExportProgress(message, percent) {
   const value = Math.round(clamp(Number(percent) || 0, 0, 100));
   $("#exportOverlay").hidden = false;
@@ -2222,32 +2212,34 @@ async function exportLocalVideo() {
     }
     drawPreviewFrame();
     const canvasStream = canvas.captureStream(30);
-    // 中间视频保留现场原音，最后一步由 FFmpeg 替换或混合对齐音乐。
-    video.muted = false;
-    video.volume = 1;
-    await addVideoAudioToStream(video, canvasStream);
+    // MediaRecorder 只负责编码处理后的画面。原声和配乐稍后直接从源文件
+    // 由 FFmpeg 按实际首帧裁取，避免手机录流启动延迟造成音画错位。
     const stream = canvasStream;
     const mimeCandidates = ["video/mp4", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
     const mimeType = mimeCandidates.find((type) => MediaRecorder.isTypeSupported(type)) || "";
     // 以源文件平均码率为基准并留出 35% 编码余量，避免旧版固定 8 Mbps 带来的明显体积/画质下降。
     const sourceBitrate = state.sourceBitrate || 20_000_000;
     const exportBitrate = Math.round(clamp(sourceBitrate * 1.35, 20_000_000, 80_000_000));
-    const recorderOptions = { videoBitsPerSecond: exportBitrate, audioBitsPerSecond: 256_000 };
+    const recorderOptions = { videoBitsPerSecond: exportBitrate };
     if (mimeType) recorderOptions.mimeType = mimeType;
     const recorder = new MediaRecorder(stream, recorderOptions);
     const chunks = [];
     recorder.addEventListener("dataavailable", (event) => { if (event.data.size) chunks.push(event.data); });
     const stopped = new Promise((resolve) => recorder.addEventListener("stop", resolve, { once: true }));
-    recorder.start(1000);
-    video.muted = false;
-    video.volume = 1;
+    video.muted = true;
+    video.volume = 0;
     await video.play();
+    await waitForPresentedVideoFrame(video, 1200);
+    drawPreviewFrame();
+    const recordStartTime = Math.max(state.trimStart, video.currentTime);
+    const recordDuration = Math.max(.1, state.trimEnd - recordStartTime);
+    recorder.start(1000);
     previewLoop();
     const visualStart = state.blurOthers ? 35 : 5;
     const visualSpan = 80 - visualStart;
     await new Promise((resolve) => {
       const timer = window.setInterval(() => {
-        const percent = (video.currentTime - state.trimStart) / Math.max(.01, state.trimEnd - state.trimStart) * 100;
+        const percent = (video.currentTime - recordStartTime) / recordDuration * 100;
         button.textContent = `导出 ${Math.round(clamp(percent, 0, 100))}%`;
         setExportProgress("正在后台生成视频画面…", visualStart + clamp(percent, 0, 100) / 100 * visualSpan);
         if (video.currentTime >= state.trimEnd - .04 || video.ended) {
@@ -2255,24 +2247,38 @@ async function exportLocalVideo() {
           video.pause();
           resolve();
         }
-      }, 120);
+      }, 40);
     });
     recorder.stop();
     await stopped;
     const intermediateBlob = new Blob(chunks, { type: recorder.mimeType || "video/webm" });
-    let blob = intermediateBlob;
-    let extension = (recorder.mimeType || "").includes("mp4") ? "mp4" : "webm";
+    let blob;
+    const extension = "mp4";
+    const muxProgress = (progress, message) => {
+      button.textContent = `音轨合成 ${Math.round(progress * 100)}%`;
+      setExportProgress(message || "正在同步最终音轨…", 80 + progress * 20);
+    };
     if (state.musicEngine?.confirmed) {
       button.textContent = "音轨合成 5%";
       blob = await state.musicEngine.muxProcessedVideo(
         intermediateBlob,
-        state.trimEnd - state.trimStart,
-        (progress, message) => {
-          button.textContent = `音轨合成 ${Math.round(progress * 100)}%`;
-          setExportProgress(message || "正在合成对齐音轨…", 80 + progress * 20);
+        recordDuration,
+        muxProgress,
+        {
+          originalFile: state.sourceFile,
+          originalStartSeconds: recordStartTime,
+          timelineShiftSeconds: recordStartTime - state.trimStart,
         },
       );
-      extension = "mp4";
+    } else {
+      button.textContent = "原声同步 5%";
+      blob = await getMusicEngine().muxOriginalAudio(
+        intermediateBlob,
+        state.sourceFile,
+        recordStartTime,
+        recordDuration,
+        muxProgress,
+      );
     }
     const filename = `DanceFocus-${Date.now()}.${extension}`;
     const file = new File([blob], filename, { type: blob.type || (extension === "mp4" ? "video/mp4" : "video/webm") });
@@ -2285,9 +2291,8 @@ async function exportLocalVideo() {
     showToast(error?.message ? `本地导出中断：${error.message}` : "本地导出中断，请保持页面在前台", 5200);
   } finally {
     video.pause();
-    // createMediaElementSource 建立后，视频原声会长期经过这个监听节点。
-    // 导出结束恢复为 100%，否则用户返回预览后会听不到现场原声。
-    if (previewAudioCapture?.monitorGain) previewAudioCapture.monitorGain.gain.value = 1;
+    video.muted = false;
+    video.volume = 1;
     state.exporting = false;
     state.exportMaskCache = [];
     state.lastPreviewCenter = null;

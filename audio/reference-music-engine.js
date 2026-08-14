@@ -460,8 +460,11 @@
 
     musicFilter(duration, outputLabel = "music", inputLabel = "0:a", options = {}) {
       if (!this.result) throw new Error("尚未完成音乐对齐");
-      const offset = safeNumber(this.result.start_offset_ms) / 1000;
       const speed = clamp(safeNumber(this.result.speed_ratio, 1), .5, 2);
+      // MediaRecorder 必须等手机真正呈现首帧后才开始。因此导出画面的
+      // 第 0 秒可能对应裁剪区内几毫秒之后，音乐也必须推进同样的时间。
+      const timelineShift = Math.max(0, safeNumber(options.timelineShiftSeconds));
+      const offset = safeNumber(this.result.start_offset_ms) / 1000 + timelineShift * speed;
       const safeDuration = Math.max(.1, duration);
       const fadeOutStart = Math.max(0, safeDuration - .08);
       const renderedVolume = options.includeVolume === false ? 1 : this.musicVolume;
@@ -590,10 +593,10 @@
       }
     }
 
-    audioCoverageSeconds() {
+    audioCoverageSeconds(timelineShiftSeconds = 0) {
       if (!this.result) return null;
       const speed = clamp(safeNumber(this.result.speed_ratio, 1), .5, 2);
-      const start = this.timelineStartMs() / 1000;
+      const start = this.timelineStartMs() / 1000 - Math.max(0, safeNumber(timelineShiftSeconds));
       const duration = Math.max(0, safeNumber(this.result.reference_duration_ms) / 1000 / speed);
       return { start, end: start + duration };
     }
@@ -760,20 +763,26 @@
       };
     }
 
-    async muxProcessedVideo(processedBlob, duration, onProgress = () => {}) {
+    async muxProcessedVideo(processedBlob, duration, onProgress = () => {}, options = {}) {
       if (!this.confirmed) throw new Error("低置信度音乐必须先手动确认对齐位置");
+      if (!options.originalFile) throw new Error("缺少课堂视频原音轨");
       const ffmpeg = await this.loadFFmpeg();
       const referenceName = await this.ensureReferenceInFs();
       const inputName = (processedBlob.type || "").includes("mp4") ? "processed-video.mp4" : "processed-video.webm";
+      const originalName = `source-original.${extensionFor(options.originalFile, "mp4")}`;
       const outputName = "dancefocus-music.mp4";
       await this.removeFile(inputName);
+      await this.removeFile(originalName);
       await this.removeFile(outputName);
       await ffmpeg.writeFile(inputName, new Uint8Array(await processedBlob.arrayBuffer()));
+      await ffmpeg.writeFile(originalName, new Uint8Array(await options.originalFile.arrayBuffer()));
       onProgress(.08, "正在组装对齐后的新音轨…");
       // 最终文件必须和用户已经试听确认的预览使用同一条全局时间线。
       // 局部锚点只用于诊断不连续片段，不能在导出时造成音乐回跳。
-      const music = this.musicFilter(duration, "music", "1:a", { forceGlobal: true });
-      const coverage = this.audioCoverageSeconds() || { start: 0, end: 0 };
+      const timelineShift = Math.max(0, safeNumber(options.timelineShiftSeconds));
+      const originalStart = Math.max(0, safeNumber(options.originalStartSeconds));
+      const music = this.musicFilter(duration, "music", "1:a", { forceGlobal: true, timelineShiftSeconds: timelineShift });
+      const coverage = this.audioCoverageSeconds(timelineShift) || { start: 0, end: 0 };
       const coverageStart = clamp(coverage.start, 0, duration);
       const coverageEnd = clamp(coverage.end, 0, duration);
       // 导出与预览保持一致：粉色音轨之外保留 100% 视频原声，
@@ -781,11 +790,11 @@
       let filter = music;
       const insideGain = this.originalVolume.toFixed(3);
       // volume 滤镜的基础音量为 100%，只在提取音轨覆盖期间切换为用户设置值。
-      filter += `;[0:a]atrim=duration=${duration.toFixed(3)},asetpts=PTS-STARTPTS,volume='if(between(t,${coverageStart.toFixed(4)},${coverageEnd.toFixed(4)}),${insideGain},1)':eval=frame[original]`;
+      filter += `;[2:a]atrim=start=${originalStart.toFixed(4)}:duration=${duration.toFixed(3)},asetpts=PTS-STARTPTS,volume='if(between(t,${coverageStart.toFixed(4)},${coverageEnd.toFixed(4)}),${insideGain},1)':eval=frame[original]`;
       filter += ";[original][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]";
       const audioMap = "[aout]";
       const args = [
-        "-hide_banner", "-loglevel", "error", "-i", inputName, "-i", referenceName,
+        "-hide_banner", "-loglevel", "error", "-i", inputName, "-i", referenceName, "-i", originalName,
         "-filter_complex", filter, "-map", "0:v:0", "-map", audioMap,
         "-c:v", "copy", "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart",
         "-t", Math.max(.1, duration).toFixed(3), outputName,
@@ -808,13 +817,59 @@
       }
       if (exitCode !== 0) {
         await this.removeFile(inputName);
+        await this.removeFile(originalName);
         throw new Error("新音轨合成失败，请换新版 Safari / Chrome 重试");
       }
       onProgress(.94, "正在完成音画同步…");
       const data = await ffmpeg.readFile(outputName);
       const blob = new Blob([data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)], { type: "video/mp4" });
       await this.removeFile(inputName);
+      await this.removeFile(originalName);
       await this.removeFile(outputName);
+      onProgress(1, "导出文件已生成");
+      return blob;
+    }
+
+    async muxOriginalAudio(processedBlob, originalFile, originalStartSeconds, duration, onProgress = () => {}) {
+      if (!originalFile) throw new Error("缺少课堂视频原音轨");
+      const ffmpeg = await this.loadFFmpeg();
+      const inputName = (processedBlob.type || "").includes("mp4") ? "processed-original.mp4" : "processed-original.webm";
+      const originalName = `source-only.${extensionFor(originalFile, "mp4")}`;
+      const outputName = "dancefocus-original.mp4";
+      for (const name of [inputName, originalName, outputName]) await this.removeFile(name);
+      await ffmpeg.writeFile(inputName, new Uint8Array(await processedBlob.arrayBuffer()));
+      await ffmpeg.writeFile(originalName, new Uint8Array(await originalFile.arrayBuffer()));
+      const safeDuration = Math.max(.1, safeNumber(duration));
+      const safeStart = Math.max(0, safeNumber(originalStartSeconds));
+      const filter = `[1:a]atrim=start=${safeStart.toFixed(4)}:duration=${safeDuration.toFixed(3)},asetpts=PTS-STARTPTS[aout]`;
+      const args = [
+        "-hide_banner", "-loglevel", "error", "-i", inputName, "-i", originalName,
+        "-filter_complex", filter, "-map", "0:v:0", "-map", "[aout]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart",
+        "-t", safeDuration.toFixed(3), outputName,
+      ];
+      const previousProgress = this.ffmpegTaskProgress;
+      this.ffmpegTaskProgress = (progress) => onProgress(.08 + progress * .84, "正在按实际首帧同步原声…");
+      let exitCode;
+      try {
+        exitCode = await ffmpeg.exec(args);
+        if (exitCode !== 0) {
+          await this.removeFile(outputName);
+          const fallbackArgs = [...args];
+          const videoCodecIndex = fallbackArgs.indexOf("copy");
+          fallbackArgs.splice(videoCodecIndex, 1, "libx264", "-preset", "veryfast", "-crf", "16");
+          exitCode = await ffmpeg.exec(fallbackArgs);
+        }
+      } finally {
+        this.ffmpegTaskProgress = previousProgress;
+      }
+      if (exitCode !== 0) {
+        for (const name of [inputName, originalName, outputName]) await this.removeFile(name);
+        throw new Error("原视频音轨合成失败");
+      }
+      const data = await ffmpeg.readFile(outputName);
+      const blob = new Blob([data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)], { type: "video/mp4" });
+      for (const name of [inputName, originalName, outputName]) await this.removeFile(name);
       onProgress(1, "导出文件已生成");
       return blob;
     }
