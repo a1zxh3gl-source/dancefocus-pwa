@@ -114,11 +114,34 @@
       this.previewUsesRawReference = false;
       this.previewBoundaryTimer = null;
       this.previewLastSyncAt = 0;
+      this.previewRequestId = 0;
       this.previewResyncThreshold = clamp(safeNumber(options.previewResyncThreshold, .35), .18, 1);
       this.previewResyncCooldownMs = Math.max(300, safeNumber(options.previewResyncCooldownMs, 900));
       this.referenceDecodedBuffer = null;
       this.referencePreviewPcm = null;
+      this.referencePreviewSampleRate = this.sampleRate;
+      this.previewQuality = "analysis";
       this.processing = false;
+    }
+
+    ensureAudioContext() {
+      const AudioContextClass = global.AudioContext || global.webkitAudioContext;
+      if (!AudioContextClass) throw new Error("当前浏览器无法解码音轨");
+      if (!this.audioContext) this.audioContext = new AudioContextClass();
+      return this.audioContext;
+    }
+
+    audioBufferFromWav(wav) {
+      const context = this.ensureAudioContext();
+      const channels = wav.channels?.length ? wav.channels : [wav.mono];
+      const length = channels[0]?.length || 0;
+      if (!length) throw new Error("预览音轨中没有有效音频");
+      const buffer = context.createBuffer(channels.length, length, wav.sampleRate);
+      channels.forEach((samples, index) => {
+        if (typeof buffer.copyToChannel === "function") buffer.copyToChannel(samples, index);
+        else buffer.getChannelData(index).set(samples);
+      });
+      return buffer;
     }
 
     emit(stage, progress, message) {
@@ -199,9 +222,7 @@
     }
 
     async decodeNormalizedPcm(file, kind, trimStart = 0, duration = null) {
-      const AudioContextClass = global.AudioContext || global.webkitAudioContext;
-      if (!AudioContextClass) throw new Error("当前浏览器无法解码音轨");
-      if (!this.audioContext) this.audioContext = new AudioContextClass();
+      this.ensureAudioContext();
       this.emit(kind, kind === "classroom" ? .2 : .34, kind === "classroom" ? "正在用手机解码课堂录音…" : "正在用手机解码干净音乐…");
       const decoded = await this.audioContext.decodeAudioData((await file.arrayBuffer()).slice(0));
       if (kind === "reference") this.referenceDecodedBuffer = decoded;
@@ -225,6 +246,44 @@
         mono[index] = value / Math.max(1, decoded.numberOfChannels);
       }
       return { sampleRate: this.sampleRate, channels: [mono], mono, duration: outputDuration };
+    }
+
+    async prepareHighQualityReferencePreview() {
+      if (this.referenceDecodedBuffer) {
+        this.alignedPreviewBuffer = this.referenceDecodedBuffer;
+        this.previewUsesRawReference = true;
+        this.previewQuality = this.referenceDecodedBuffer.sampleRate >= 32000 ? "source" : "analysis";
+        return this.alignedPreviewBuffer;
+      }
+      this.ensureAudioContext();
+      // 预览音质不能使用用于特征匹配的 22.05kHz 单声道 PCM。
+      // 先让 Safari 以源采样率/源声道直接解码，避免高频丢失和立体声变单声道。
+      if (this.referenceFile) {
+        try {
+          const decoded = await this.audioContext.decodeAudioData((await this.referenceFile.arrayBuffer()).slice(0));
+          if (decoded?.length && decoded.duration > 0) {
+            this.referenceDecodedBuffer = decoded;
+            this.alignedPreviewBuffer = decoded;
+            this.previewUsesRawReference = true;
+            this.previewQuality = "source";
+            return decoded;
+          }
+        } catch (error) {
+          console.warn("Safari 无法直接解码参考视频，将使用 FFmpeg 高保真预览", error);
+        }
+      }
+      // 最后才使用分析 PCM 兼容预览；它只是降级路径，不再作为手机默认音质。
+      if (this.referencePreviewPcm?.length) {
+        const decoded = this.audioContext.createBuffer(1, this.referencePreviewPcm.length, this.referencePreviewSampleRate || this.sampleRate);
+        if (typeof decoded.copyToChannel === "function") decoded.copyToChannel(this.referencePreviewPcm, 0);
+        else decoded.getChannelData(0).set(this.referencePreviewPcm);
+        this.referenceDecodedBuffer = decoded;
+        this.alignedPreviewBuffer = decoded;
+        this.previewUsesRawReference = true;
+        this.previewQuality = "analysis";
+        return decoded;
+      }
+      throw new Error("参考音乐预览准备失败");
     }
 
     async extractWithFallback(file, kind, trimStart = 0, duration = null) {
@@ -289,6 +348,8 @@
       this.referenceFile = null;
       this.referenceDecodedBuffer = null;
       this.referencePreviewPcm = null;
+      this.referencePreviewSampleRate = this.sampleRate;
+      this.previewQuality = "analysis";
       this.confirmed = false;
       this.result = null;
       this.alignedPreviewBuffer = null;
@@ -302,7 +363,8 @@
         this.referenceFile = referenceFile;
         // 保留 FFmpeg 已解码的完整提取音轨。手机不能直接用 Web Audio 解码 MP4 时，
         // 仍可用这份 PCM 实时试听拖动后的位置。
-        this.referencePreviewPcm = reference.mono.slice();
+        this.referencePreviewPcm = reference.mono;
+        this.referencePreviewSampleRate = reference.sampleRate || this.sampleRate;
         // FFmpeg 已加载时预写入参考音频；如果手机上只有 Web Audio 兼容解码，
         // 不在此处再强制启动 FFmpeg，避免已算出的匹配结果被覆盖为失败。
         if (this.ffmpeg) await this.writeReferenceFile(referenceFile);
@@ -314,6 +376,7 @@
         });
         result.reference_audio_path = referenceFile.name || "reference-audio";
         result.reference_duration_ms = Math.round(reference.duration * 1000);
+        result.video_duration_ms = Math.round(duration * 1000);
         result.original_volume = this.originalVolume;
         result.music_volume = this.musicVolume;
         result.mode = this.mode;
@@ -322,9 +385,10 @@
         this.referenceFile = referenceFile;
         this.emit("preview", .84, "正在将提取音轨绑定到视频时间线…");
         if (result.start_offset_ms != null) {
-          // 预览始终使用完整提取音轨，再根据“视频当前时间 - 音轨起点”实时定位。
-          // 这样无论从 0 秒、1 秒还是 15 秒开始播放，都不会把音乐重新从 0 计时。
-          await this.prepareRawReferencePreview();
+          // FFmpeg 将“音轨起点+保持音调的变速”直接渲染到和视频等长的
+          // 48kHz 立体声时间线。手机与电脑因此使用同一时间基准，不再用
+          // 22.05kHz 分析 PCM 做最终试听。
+          await this.prepareTimelinePreview(duration);
         }
         this.emit("done", 1, "音乐对齐完成");
         return result;
@@ -339,13 +403,14 @@
       return this.referenceInputName;
     }
 
-    musicFilter(duration, outputLabel = "music", inputLabel = "0:a") {
+    musicFilter(duration, outputLabel = "music", inputLabel = "0:a", options = {}) {
       if (!this.result) throw new Error("尚未完成音乐对齐");
       const offset = safeNumber(this.result.start_offset_ms) / 1000;
       const speed = clamp(safeNumber(this.result.speed_ratio, 1), .5, 2);
       const safeDuration = Math.max(.1, duration);
       const fadeOutStart = Math.max(0, safeDuration - .08);
-      const mappings = (this.result.segment_mapping || []).filter((item) => (
+      const renderedVolume = options.includeVolume === false ? 1 : this.musicVolume;
+      const mappings = (options.forceGlobal ? [] : (this.result.segment_mapping || [])).filter((item) => (
         safeNumber(item.video_end_ms) > safeNumber(item.video_start_ms)
         && safeNumber(item.music_start_ms) >= 0
       ));
@@ -353,7 +418,7 @@
         const placement = offset >= 0
           ? `atrim=start=${offset.toFixed(4)},asetpts=PTS-STARTPTS,atempo=${speed.toFixed(6)}`
           : `asetpts=PTS-STARTPTS,atempo=${speed.toFixed(6)},adelay=${Math.round(-offset / speed * 1000)}:all=1`;
-        return `[${inputLabel}]${placement},volume=${this.musicVolume.toFixed(3)},apad,atrim=duration=${safeDuration.toFixed(3)},afade=t=in:st=0:d=0.03,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.08[${outputLabel}]`;
+        return `[${inputLabel}]${placement},volume=${renderedVolume.toFixed(3)},apad,atrim=duration=${safeDuration.toFixed(3)},afade=t=in:st=0:d=0.03,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.08[${outputLabel}]`;
       }
       // 暂停、剪切、重复播放或跳段时，根据全局锚点分段裁取并重新拼接，不强行使用一个全局偏移。
       const filters = [`[${inputLabel}]asplit=${mappings.length}${mappings.map((_, index) => `[source${index}]`).join("")}`];
@@ -367,7 +432,7 @@
         labels.push(`[part${index}]`);
       });
       filters.push(`${labels.join("")}concat=n=${labels.length}:v=0:a=1[joined]`);
-      filters.push(`[joined]volume=${this.musicVolume.toFixed(3)},apad,atrim=duration=${safeDuration.toFixed(3)},afade=t=in:st=0:d=0.03,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.08[${outputLabel}]`);
+      filters.push(`[joined]volume=${renderedVolume.toFixed(3)},apad,atrim=duration=${safeDuration.toFixed(3)},afade=t=in:st=0:d=0.03,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.08[${outputLabel}]`);
       return filters.join(";");
     }
 
@@ -376,39 +441,39 @@
       const referenceName = await this.ensureReferenceInFs();
       const outputName = "aligned-preview.wav";
       await this.removeFile(outputName);
+      const context = this.ensureAudioContext();
+      const previewSampleRate = context.sampleRate >= 44100 ? Math.min(48000, context.sampleRate) : 48000;
       const exitCode = await ffmpeg.exec([
         "-hide_banner", "-loglevel", "error", "-i", referenceName,
-        "-filter_complex", this.musicFilter(duration, "music", "0:a"),
-        "-map", "[music]", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", outputName,
+        // 实时预览保持之前经验证的全局偏移逻辑；不连续分段只在最终导出使用，
+        // 避免低置信局部锚点在手机试听中造成突然跳段。
+        "-filter_complex", this.musicFilter(duration, "music", "0:a", { includeVolume: false, forceGlobal: true }),
+        "-map", "[music]", "-ar", String(previewSampleRate), "-ac", "2", "-c:a", "pcm_s16le", outputName,
       ]);
       if (exitCode !== 0) throw new Error("对齐音轨预览生成失败");
       const data = await ffmpeg.readFile(outputName);
       await this.removeFile(outputName);
-      const AudioContextClass = global.AudioContext || global.webkitAudioContext;
-      if (!AudioContextClass) throw new Error("当前浏览器不支持音频预览");
-      if (!this.audioContext) this.audioContext = new AudioContextClass();
-      const copy = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-      this.alignedPreviewBuffer = await this.audioContext.decodeAudioData(copy);
+      // 不再把 WAV 交给 iOS decodeAudioData 二次解码，避免不同 Safari
+      // 版本对 WAVE_FORMAT_EXTENSIBLE/采样率的差异。我们按头部精确创建 AudioBuffer。
+      this.alignedPreviewBuffer = this.audioBufferFromWav(parseWav(data));
       this.previewUsesRawReference = false;
+      this.previewQuality = "timeline-hq";
       return this.alignedPreviewBuffer;
     }
 
+    async prepareTimelinePreview(duration) {
+      if (this.ffmpeg) {
+        try {
+          return await this.renderAlignedPreview(duration);
+        } catch (error) {
+          console.warn("高保真时间线预览生成失败，改用源音轨预览", error);
+        }
+      }
+      return this.prepareHighQualityReferencePreview();
+    }
+
     async prepareRawReferencePreview() {
-      const AudioContextClass = global.AudioContext || global.webkitAudioContext;
-      if (!AudioContextClass) throw new Error("当前浏览器不支持音频预览");
-      if (!this.audioContext) this.audioContext = new AudioContextClass();
-      if (!this.referenceDecodedBuffer && this.referencePreviewPcm?.length) {
-        const decoded = this.audioContext.createBuffer(1, this.referencePreviewPcm.length, this.sampleRate);
-        decoded.copyToChannel(this.referencePreviewPcm, 0);
-        this.referenceDecodedBuffer = decoded;
-      }
-      if (!this.referenceDecodedBuffer && this.referenceFile) {
-        this.referenceDecodedBuffer = await this.audioContext.decodeAudioData((await this.referenceFile.arrayBuffer()).slice(0));
-      }
-      if (!this.referenceDecodedBuffer) throw new Error("参考音乐预览准备失败");
-      this.alignedPreviewBuffer = this.referenceDecodedBuffer;
-      this.previewUsesRawReference = true;
-      return this.alignedPreviewBuffer;
+      return this.prepareHighQualityReferencePreview();
     }
 
     setCandidate(candidate, manual = false) {
@@ -442,7 +507,10 @@
       if (!this.result) return;
       const speed = clamp(safeNumber(this.result.speed_ratio, 1), .96, 1.04);
       this.setCandidate({ start_offset_ms: -safeNumber(trackStartMs) * speed, speed_ratio: speed }, true);
-      await this.prepareRawReferencePreview();
+      const intervalDurationMs = safeNumber(this.result.best_interval?.video_end_ms, 0)
+        - safeNumber(this.result.best_interval?.video_start_ms, 0);
+      const duration = Math.max(.1, safeNumber(this.result.video_duration_ms, intervalDurationMs) / 1000);
+      await this.prepareTimelinePreview(duration);
       this.confirm();
     }
 
@@ -501,8 +569,12 @@
         this.applyVideoVolume(video, trimStart);
         return;
       }
-      this.stopPreview();
+      const requestId = ++this.previewRequestId;
+      this.stopPreview(false);
       await this.audioContext.resume();
+      // seeked、play 与手动拖动在 iPhone 上可能同时触发。旧的异步启动
+      // 不得覆盖最新的视频位置，否则会听到错位或双音轨。
+      if (requestId !== this.previewRequestId || video.paused || video.seeking) return;
       const relativeTime = Math.max(0, video.currentTime - trimStart);
       const speed = safeNumber(this.result?.speed_ratio, 1);
       // 音轨是固定在视频时间线上的片段：
@@ -566,7 +638,8 @@
       };
     }
 
-    stopPreview() {
+    stopPreview(invalidatePending = true) {
+      if (invalidatePending) this.previewRequestId += 1;
       if (this.previewBoundaryTimer) global.clearTimeout(this.previewBoundaryTimer);
       this.previewBoundaryTimer = null;
       if (this.previewSource) {
@@ -683,6 +756,8 @@
       this.alignedPreviewBuffer = null;
       this.referenceDecodedBuffer = null;
       this.referencePreviewPcm = null;
+      this.referencePreviewSampleRate = this.sampleRate;
+      this.previewQuality = "analysis";
       this.previewUsesRawReference = false;
       this.mode = "replace";
       this.originalVolume = 0;

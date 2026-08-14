@@ -1162,7 +1162,7 @@ async function renderAudioResult(result) {
   const engine = getMusicEngine();
   if (result.start_offset_ms == null) {
     engine.setCandidate({ start_offset_ms: 0, speed_ratio: 1 }, true);
-    await engine.prepareRawReferencePreview();
+    await engine.prepareTimelinePreview(Math.max(.1, state.trimEnd - state.trimStart));
   }
   engine.confirm();
   state.audioAlignment = engine.exportParameters();
@@ -1962,6 +1962,21 @@ function previewLoop() {
   if (!$("#previewVideo").paused) window.requestAnimationFrame(previewLoop);
 }
 
+async function waitForPresentedVideoFrame(video, timeoutMs = 420) {
+  if (!video || video.paused || typeof video.requestVideoFrameCallback !== "function") return;
+  await new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const timer = window.setTimeout(finish, timeoutMs);
+    video.requestVideoFrameCallback(finish);
+  });
+}
+
 $("#previewPlay").addEventListener("click", async () => {
   const video = $("#previewVideo");
   if (video.paused) {
@@ -1973,7 +1988,10 @@ $("#previewPlay").addEventListener("click", async () => {
         await preparePreviewMaskTimeline();
       }
       await video.play();
-      if (state.musicEngine?.confirmed) await state.musicEngine.startPreview(video, state.trimStart);
+      // iPhone 的 play() Promise 可能早于首个画面帧真正呈现。
+      // 等视频时钟开始走动后再启动配乐，避免手机端音乐抢跑。
+      await waitForPresentedVideoFrame(video);
+      if (!video.paused && state.musicEngine?.confirmed) await state.musicEngine.startPreview(video, state.trimStart);
     } catch (_) { showToast("请再点一次播放"); }
   } else {
     video.pause();
@@ -2001,7 +2019,8 @@ $("#previewVideo").addEventListener("seeked", async () => {
   drawPreviewFrame();
   // 视频停在新位置后，按时间线固定关系重新定位提取音轨。
   if (!$("#previewVideo").paused && state.musicEngine?.confirmed) {
-    await state.musicEngine.startPreview($("#previewVideo"), state.trimStart);
+    await waitForPresentedVideoFrame($("#previewVideo"));
+    if (!$("#previewVideo").paused) await state.musicEngine.startPreview($("#previewVideo"), state.trimStart);
   }
 });
 $("#previewVideo").addEventListener("timeupdate", () => {

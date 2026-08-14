@@ -312,7 +312,8 @@
 
   function regressionFromAnchors(anchors, fallbackOffset, fallbackSpeed) {
     const reliable = anchors.filter((anchor) => anchor.score >= .48);
-    if (reliable.length < 2) return { offsetSeconds: fallbackOffset, speedRatio: fallbackSpeed, residual: Infinity };
+    const spanSeconds = reliable.length >= 2 ? reliable[reliable.length - 1].videoTime - reliable[0].videoTime : 0;
+    if (reliable.length < 2) return { offsetSeconds: fallbackOffset, speedRatio: fallbackSpeed, residual: Infinity, reliableCount: reliable.length, spanSeconds };
     let sx = 0; let sy = 0; let sxx = 0; let sxy = 0;
     reliable.forEach(({ videoTime: x, musicTime: y }) => { sx += x; sy += y; sxx += x * x; sxy += x * y; });
     const count = reliable.length;
@@ -321,7 +322,7 @@
     const offsetSeconds = (sy - speedRatio * sx) / count;
     let residual = 0;
     reliable.forEach(({ videoTime, musicTime }) => { residual += Math.abs(musicTime - (offsetSeconds + speedRatio * videoTime)); });
-    return { offsetSeconds, speedRatio, residual: residual / count };
+    return { offsetSeconds, speedRatio, residual: residual / count, reliableCount: reliable.length, spanSeconds };
   }
 
   function buildSegmentMapping(anchors, duration, offsetSeconds, speedRatio) {
@@ -382,9 +383,11 @@
     const regression = regressionFromAnchors(anchors, best.start_offset_ms / 1000, best.speedRatio);
     // 只在多个可靠锚点确实显示漂移时才变速；否则保持 1.0，避免错误的 0.98× 越播越偏。
     const safeSpeed = Number.isFinite(regression.residual)
-      && regression.residual <= .24
-      && regression.speedRatio >= .96
-      && regression.speedRatio <= 1.04
+      && regression.reliableCount >= 4
+      && regression.spanSeconds >= 8
+      && regression.residual <= .16
+      && regression.speedRatio >= .985
+      && regression.speedRatio <= 1.015
       ? regression.speedRatio
       : 1;
     const duration = querySamples.length / sampleRate;
