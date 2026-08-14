@@ -1121,6 +1121,7 @@ function drawWaveform(canvas, values, color) {
 }
 
 function audioStatusLabel(result) {
+  if (!result.cross_device_stable) return "请试听确认";
   return result.status === "matched" ? "已自动对齐" : "可拖动微调";
 }
 
@@ -1159,8 +1160,8 @@ function renderAudioTimeline() {
   clip.setAttribute("aria-valuenow", String(Math.round(trackStart)));
   if (trackStart >= 0) {
     // 匹配引擎的 trackStart 是“裁剪后成片内”的相对时间。
-    // 跨设备对比时必须显示原视频绝对时间，否则手机裁掉 1.716s 后
-    // 会把同一个 3.509s 位置误显示为 1.793s。
+    // 原视频绝对时间由每个项目实际的 trimStart 动态计算，不能使用
+    // 任何某个示例视频的固定修正值。
     $("#audioTrackPosition").textContent = trimStartMs > 5
       ? `从原视频 ${formatMusicOffset(sourceTrackStart)} 开始（成片内 ${formatMusicOffset(trackStart)}）`
       : `从原视频 ${formatMusicOffset(sourceTrackStart)} 开始`;
@@ -1206,7 +1207,9 @@ $("#referenceAudioPicker").addEventListener("change", async (event) => {
     });
     await renderAudioResult(result);
     if (!$("#previewVideo").paused) await engine.startPreview($("#previewVideo"), state.trimStart);
-    showToast(result.status === "matched" ? "已提取音乐并自动对齐" : "已提取音乐，请在进度条下拖动微调", 4600);
+    showToast(result.status === "matched" && result.cross_device_stable
+      ? "已提取音乐并自动对齐"
+      : "已提取音乐，请试听确认；需要时可拖动微调", 4600);
   } catch (error) {
     console.error(error);
     $("#audioMatchBadge").textContent = "处理失败";

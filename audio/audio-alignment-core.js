@@ -285,6 +285,35 @@
     return { offsetSeconds: (bestFrame + subFrame) * referenceEnvelope.hopSeconds - queryStartSeconds, correlation: bestScore };
   }
 
+  function candidateConsistency(query, reference, candidate) {
+    // 不只看开头或单个强节拍：沿课堂视频取多个 3 秒窗口，在候选位置附近
+    // 复核旋律、MFCC、节拍是否持续一致。重复副歌或偶然相似只会得到较低支持率。
+    const windowFrames = Math.max(12, Math.round(3 / query.frameDuration));
+    const searchRadius = Math.max(2, Math.round(.55 / reference.frameDuration));
+    const windows = [];
+    for (let start = 0; start < query.count; start += windowFrames) {
+      const end = Math.min(query.count, start + windowFrames);
+      if (end - start < Math.max(8, Math.round(windowFrames * .45))) continue;
+      let bestScore = -Infinity;
+      let bestDelta = 0;
+      for (let delta = -searchRadius; delta <= searchRadius; delta += 1) {
+        const score = scoreOffset(query, reference, candidate.offsetFrame + delta, candidate.speedRatio, start, end);
+        if (score > bestScore) {
+          bestScore = score;
+          bestDelta = delta;
+        }
+      }
+      windows.push({ score: bestScore, deviation: Math.abs(bestDelta) * reference.frameDuration });
+    }
+    if (!windows.length) return { meanScore: candidate.score, support: 0, residual: 1 };
+    const reliable = windows.filter((window) => window.score >= .46);
+    const meanScore = windows.reduce((sum, window) => sum + window.score, 0) / windows.length;
+    const residual = reliable.length
+      ? reliable.reduce((sum, window) => sum + window.deviation, 0) / reliable.length
+      : 1;
+    return { meanScore, support: reliable.length / windows.length, residual };
+  }
+
   function localAnchors(query, reference, offsetFrame, speedRatio) {
     // 较短窗可在暂停、剪切或跳段后尽快生成新锚点，而不把不连续音频强行拉成一条直线。
     const windowFrames = Math.max(12, Math.round(3 / query.frameDuration));
@@ -370,11 +399,32 @@
     const refined = coarse.map((candidate) => {
       const coarseSeconds = candidate.offsetFrame * reference.frameDuration;
       const fine = fineOffset(querySamples, referenceSamples, sampleRate, coarseSeconds);
-      return { ...candidate, start_offset_ms: Math.round(fine.offsetSeconds * 1000), fine_correlation: fine.correlation };
+      const consistency = candidateConsistency(query, reference, candidate);
+      const selectionScore = candidate.score * .64
+        + Math.max(0, fine.correlation) * .16
+        + consistency.meanScore * .14
+        + consistency.support * .06
+        - Math.min(.05, consistency.residual * .035);
+      return {
+        ...candidate,
+        start_offset_ms: Math.round(fine.offsetSeconds * 1000),
+        fine_correlation: fine.correlation,
+        consistency_score: consistency.meanScore,
+        consistency_support: consistency.support,
+        consistency_residual: consistency.residual,
+        selection_score: selectionScore,
+      };
     });
-    refined.sort((a, b) => (b.score + Math.max(0, b.fine_correlation) * .08) - (a.score + Math.max(0, a.fine_correlation) * .08));
+    // 先量化再排序，避免不同浏览器的微小浮点尾数改变候选先后顺序。
+    refined.sort((a, b) => {
+      const scoreDifference = Math.round(b.selection_score * 1000000) - Math.round(a.selection_score * 1000000);
+      if (scoreDifference) return scoreDifference;
+      const correlationDifference = Math.round(b.fine_correlation * 1000000) - Math.round(a.fine_correlation * 1000000);
+      if (correlationDifference) return correlationDifference;
+      return a.start_offset_ms - b.start_offset_ms;
+    });
     const best = refined[0]; const second = refined[1];
-    const margin = second ? best.score - second.score : .2;
+    const margin = second ? best.selection_score - second.selection_score : .2;
     const scoreConfidence = clamp((best.score - .42) / .34, 0, 1);
     const marginConfidence = clamp(margin / .10, 0, 1);
     const fineConfidence = clamp((best.fine_correlation + .05) / .55, 0, 1);
@@ -392,7 +442,7 @@
       : 1;
     const duration = querySamples.length / sampleRate;
     const segmentMapping = buildSegmentMapping(anchors, duration, best.start_offset_ms / 1000, safeSpeed);
-    const ambiguous = Boolean(second && margin < .035);
+    const ambiguous = Boolean(second && margin < .025);
     // 不同歌曲在很长参考音乐中也可能出现偶然的粗匹配；精相关过低时必须降权，不允许静默作为高置信结果。
     const fineQuality = clamp((best.fine_correlation + .05) / .7, 0, 1);
     const confidence = clamp(rawConfidence * (.58 + .42 * fineQuality), 0, 1);
@@ -410,7 +460,16 @@
       ambiguous,
       match_score: best.score,
       best_interval: { video_start_ms: 0, video_end_ms: Math.round(duration * 1000), music_start_ms: best.start_offset_ms, music_end_ms: Math.round(best.start_offset_ms + duration * 1000 * safeSpeed) },
-      candidates: refined.slice(0, 3).map((candidate) => ({ start_offset_ms: candidate.start_offset_ms, speed_ratio: candidate.speedRatio, confidence: clamp((candidate.score - .40) / .38, 0, 1), score: candidate.score, fine_correlation: candidate.fine_correlation })),
+      candidates: refined.slice(0, 3).map((candidate) => ({
+        start_offset_ms: candidate.start_offset_ms,
+        speed_ratio: candidate.speedRatio,
+        confidence: clamp((candidate.selection_score - .40) / .38, 0, 1),
+        score: candidate.score,
+        fine_correlation: candidate.fine_correlation,
+        consistency_score: candidate.consistency_score,
+        consistency_support: candidate.consistency_support,
+        selection_score: candidate.selection_score,
+      })),
       anchors,
       segment_mapping: segmentMapping,
       drift_residual_ms: Number.isFinite(regression.residual) ? Math.round(regression.residual * 1000) : null,
@@ -420,7 +479,7 @@
     };
   }
 
-  const api = { extractFeatures, coarseCandidates, fineOffset, alignAudio, waveform, scoreOffset, buildSegmentMapping };
+  const api = { extractFeatures, coarseCandidates, fineOffset, alignAudio, waveform, scoreOffset, buildSegmentMapping, candidateConsistency };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   global.AudioAlignmentCore = api;
 })(typeof self !== "undefined" ? self : globalThis);

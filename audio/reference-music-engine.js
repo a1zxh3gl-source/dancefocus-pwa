@@ -15,6 +15,41 @@
     return Number.isFinite(number) ? number : fallback;
   }
 
+  function canonicalizePcm(samples) {
+    const output = new Float32Array(samples?.length || 0);
+    for (let index = 0; index < output.length; index += 1) {
+      const value = clamp(safeNumber(samples[index]), -1, 1);
+      // 匹配特征统一建立在 16-bit PCM 上。这样即使手机和电脑内部的
+      // 浮点实现略有差别，也不会因极小的解码尾数差异选到不同候选位置。
+      const integer = value <= -1 ? -32768 : value >= 1 ? 32767 : Math.round(value * 32767);
+      output[index] = integer / 32768;
+    }
+    return output;
+  }
+
+  function pcmSignature(samples) {
+    // 仅用于诊断两台设备是否实际分析了同一份标准化音频，不参与匹配结果。
+    let hash = 2166136261;
+    const stride = Math.max(1, Math.floor((samples?.length || 0) / 120000));
+    for (let index = 0; index < (samples?.length || 0); index += stride) {
+      const integer = Math.round(clamp(safeNumber(samples[index]), -1, 1) * 32768);
+      hash ^= integer & 0xffff;
+      hash = Math.imul(hash, 16777619) >>> 0;
+    }
+    return hash.toString(16).padStart(8, "0");
+  }
+
+  function canonicalPcmResult(wav, backend) {
+    const mono = canonicalizePcm(wav.mono);
+    return {
+      ...wav,
+      channels: [mono],
+      mono,
+      backend,
+      pcm_signature: pcmSignature(mono),
+    };
+  }
+
   function parseWav(bytes) {
     const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
     const view = new DataView(buffer);
@@ -209,7 +244,9 @@
       if (kind === "classroom" && trimStart > 0) args.push("-ss", trimStart.toFixed(3));
       args.push("-i", inputName);
       if (kind === "classroom" && duration != null) args.push("-t", Math.max(.1, duration).toFixed(3));
-      args.push("-vn", "-map", "0:a:0", "-ac", "1", "-ar", String(this.sampleRate), "-c:a", "pcm_f32le", outputName);
+      // 所有设备都让同一套 FFmpeg WASM 输出单声道 16-bit PCM，禁止电脑与
+      // 手机分别使用不同浮点解码路径后再直接比较特征。
+      args.push("-vn", "-map", "0:a:0", "-ac", "1", "-ar", String(this.sampleRate), "-c:a", "pcm_s16le", outputName);
       const exitCode = await ffmpeg.exec(args);
       if (exitCode !== 0) {
         await this.removeFile(inputName);
@@ -218,7 +255,7 @@
       const wav = parseWav(await ffmpeg.readFile(outputName));
       await this.removeFile(inputName);
       await this.removeFile(outputName);
-      return wav;
+      return canonicalPcmResult(wav, "ffmpeg-s16");
     }
 
     async decodeNormalizedPcm(file, kind, trimStart = 0, duration = null) {
@@ -245,7 +282,7 @@
         }
         mono[index] = value / Math.max(1, decoded.numberOfChannels);
       }
-      return { sampleRate: this.sampleRate, channels: [mono], mono, duration: outputDuration };
+      return canonicalPcmResult({ sampleRate: this.sampleRate, channels: [mono], mono, duration: outputDuration }, "web-audio-fallback");
     }
 
     async prepareHighQualityReferencePreview() {
@@ -381,6 +418,14 @@
         result.music_volume = this.musicVolume;
         result.mode = this.mode;
         result.trim_start_ms = Math.round(trimStart * 1000);
+        result.classroom_extraction_backend = classroom.backend;
+        result.reference_extraction_backend = reference.backend;
+        result.classroom_pcm_signature = classroom.pcm_signature;
+        result.reference_pcm_signature = reference.pcm_signature;
+        result.cross_device_stable = classroom.backend === "ffmpeg-s16" && reference.backend === "ffmpeg-s16";
+        // 浏览器兼容解码仍可救回少数特殊文件，但不再把它伪装成跨设备
+        // 完全一致的自动结果；界面会提醒用户试听确认。
+        result.requires_manual_confirmation = !result.cross_device_stable || result.status !== "matched";
         this.result = result;
         this.referenceFile = referenceFile;
         this.emit("preview", .84, "正在将提取音轨绑定到视频时间线…");

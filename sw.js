@@ -1,5 +1,5 @@
 /* DanceFocus PWA：只缓存程序和本地 AI 模型，绝不读取或缓存用户选择的视频 Blob。 */
-const VERSION = "dancefocus-pwa-20260814-4";
+const VERSION = "dancefocus-pwa-20260814-5";
 const SHELL_CACHE = `${VERSION}-shell`;
 const RUNTIME_CACHE = `${VERSION}-runtime`;
 const APP_SHELL = [
