@@ -123,8 +123,14 @@
         instance.on("log", ({ message }) => {
           if (/error|invalid|failed/i.test(message || "")) console.warn("FFmpeg:", message);
         });
+        // 当前发布包使用 @ffmpeg/ffmpeg 的 UMD 版本。不要把 UMD 的
+        // 814.ffmpeg.js 显式作为 classWorkerURL 传入：这会让包装器把它
+        // 创建成 module worker，而 iOS Safari 的 module worker 中没有
+        // importScripts，最终导致 FFmpeg 失败。Chrome 能用 Web Audio
+        // 直接解码 MP4，所以以前电脑上会被降级逻辑掩盖。
+        // 省略 classWorkerURL 后，UMD 包会按 ffmpeg.js 所在目录
+        // 自动创建正确的 classic worker，GitHub Pages 子路径也能正确解析。
         await instance.load({
-          classWorkerURL: this.classWorkerURL,
           coreURL: this.coreURL,
           wasmURL: this.wasmURL,
         });
