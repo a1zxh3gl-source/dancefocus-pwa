@@ -1145,16 +1145,30 @@ function renderAudioTimeline() {
   const videoDuration = Math.max(100, (state.trimEnd - state.trimStart) * 1000);
   const speed = Number(result.speed_ratio || 1);
   const trackStart = engine.timelineStartMs();
+  const trimStartMs = state.trimStart * 1000;
+  const sourceTrackStart = trimStartMs + trackStart;
   const trackDuration = Math.max(100, Number(result.reference_duration_ms || 0) / speed);
   timeline.hidden = false;
   clip.style.left = `${trackStart / videoDuration * 100}%`;
   clip.style.width = `${trackDuration / videoDuration * 100}%`;
+  clip.dataset.trimStartMs = String(Math.round(trimStartMs));
+  clip.dataset.relativeStartMs = String(Math.round(trackStart));
+  clip.dataset.sourceStartMs = String(Math.round(sourceTrackStart));
   clip.setAttribute("aria-valuemin", String(Math.round(audioTrackLimits().min)));
   clip.setAttribute("aria-valuemax", String(Math.round(audioTrackLimits().max)));
   clip.setAttribute("aria-valuenow", String(Math.round(trackStart)));
-  $("#audioTrackPosition").textContent = trackStart >= 0
-    ? `从视频 ${formatMusicOffset(trackStart)} 开始`
-    : `左侧裁去 ${formatMusicOffset(trackStart)}`;
+  if (trackStart >= 0) {
+    // 匹配引擎的 trackStart 是“裁剪后成片内”的相对时间。
+    // 跨设备对比时必须显示原视频绝对时间，否则手机裁掉 1.716s 后
+    // 会把同一个 3.509s 位置误显示为 1.793s。
+    $("#audioTrackPosition").textContent = trimStartMs > 5
+      ? `从原视频 ${formatMusicOffset(sourceTrackStart)} 开始（成片内 ${formatMusicOffset(trackStart)}）`
+      : `从原视频 ${formatMusicOffset(sourceTrackStart)} 开始`;
+  } else if (sourceTrackStart >= 0) {
+    $("#audioTrackPosition").textContent = `原视频 ${formatMusicOffset(sourceTrackStart)} 已开始（裁剪区左侧裁去 ${formatMusicOffset(-trackStart)}）`;
+  } else {
+    $("#audioTrackPosition").textContent = `音乐早于原视频，左侧裁去 ${formatMusicOffset(-trackStart)}`;
+  }
   drawWaveform($("#audioTrackWaveform"), result.reference_waveform, "rgba(255,255,255,.88)");
 }
 

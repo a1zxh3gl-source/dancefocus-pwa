@@ -685,10 +685,17 @@
 
     exportParameters() {
       if (!this.result) return null;
+      const trackStartInTrimMs = Math.round(this.timelineStartMs());
+      const trimStartMs = Math.round(safeNumber(this.result.trim_start_ms));
       return {
         reference_audio_path: this.referenceFile?.name || this.result.reference_audio_path || "",
         start_offset_ms: Math.round(safeNumber(this.result.start_offset_ms)),
-        track_start_ms: Math.round(this.timelineStartMs()),
+        // track_start_ms 保留旧字段语义（成片/裁剪区内相对时间）；
+        // 新字段明确保存原视频绝对时间，避免电脑和手机裁剪起点不同时被误认为对齐结果不同。
+        track_start_ms: trackStartInTrimMs,
+        track_start_in_trim_ms: trackStartInTrimMs,
+        track_start_in_source_ms: trimStartMs + trackStartInTrimMs,
+        trim_start_ms: trimStartMs,
         speed_ratio: safeNumber(this.result.speed_ratio, 1),
         segment_mapping: this.result.segment_mapping || [],
         confidence: safeNumber(this.result.confidence),
