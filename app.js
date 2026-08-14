@@ -56,6 +56,9 @@ const state = {
   previewMaskProgress: 0,
   maskUncertainTimes: [],
   exportMaskCache: [],
+  previewScrubbing: false,
+  exportedFile: null,
+  exportResultUrl: "",
   musicEngine: null,
   audioAlignment: null,
 };
@@ -80,16 +83,27 @@ function showToast(message, duration = 2400) {
   showToast.timer = window.setTimeout(() => toast.classList.remove("show"), duration);
 }
 
+let audioAnalysisHideTimer = 0;
+
 function getMusicEngine() {
   if (!state.musicEngine) {
     if (!window.ReferenceMusicEngine) throw new Error("参考音乐引擎未加载");
     state.musicEngine = new window.ReferenceMusicEngine({
-      onProgress: ({ progress, message }) => {
+      onProgress: ({ stage, progress, message }) => {
+        // 自动对齐已经结束后，预览缓存或导出的 FFmpeg 任务不再复用
+        // 这里的进度条，避免出现“已自动对齐”下面仍停在 20%。
+        if (stage === "ffmpeg" && !state.musicEngine?.processing) return;
         const percent = Math.round(progress * 100);
         $("#audioAnalysisStatus").hidden = false;
         $("#audioAnalysisText").textContent = message || "正在处理音频…";
         $("#audioAnalysisPercent").textContent = `${percent}%`;
         $("#audioAnalysisProgress").style.width = `${percent}%`;
+        window.clearTimeout(audioAnalysisHideTimer);
+        if (stage === "done") {
+          audioAnalysisHideTimer = window.setTimeout(() => {
+            $("#audioAnalysisStatus").hidden = true;
+          }, 500);
+        }
       },
     });
   }
@@ -99,6 +113,10 @@ function getMusicEngine() {
 function showPage(page, push = true) {
   const next = Number(page);
   if (!Number.isInteger(next) || next < 1 || next > 6) return;
+  if (state.exporting && next !== 6) {
+    showToast("正在生成视频，请等待导出完成");
+    return;
+  }
   if (push && next !== state.page) state.history.push(state.page);
   state.page = next;
   $$(".screen").forEach((screen) => screen.classList.toggle("active", Number(screen.dataset.page) === next));
@@ -110,6 +128,10 @@ function showPage(page, push = true) {
 }
 
 $$('[data-back]').forEach((button) => button.addEventListener("click", () => {
+  if (state.exporting) {
+    showToast("正在生成视频，导出完成前不能关闭此页面");
+    return;
+  }
   state.analysisAbort = true;
   const previous = state.history.pop() ?? Math.max(1, state.page - 1);
   showPage(previous, false);
@@ -258,6 +280,9 @@ function resetProjectState() {
   state.previewMaskProgress = 0;
   state.maskUncertainTimes = [];
   state.exportMaskCache = [];
+  state.previewScrubbing = false;
+  releaseExportResult();
+  $("#exportOverlay").hidden = true;
   state.identityReady = false;
   state.audioAlignment = null;
   if (state.musicEngine) state.musicEngine.reset();
@@ -1185,6 +1210,9 @@ async function renderAudioResult(result) {
   $("#audioMatchBadge").textContent = audioStatusLabel(result);
   renderAudioTimeline();
   updateAudioMixSettings();
+  audioAnalysisHideTimer = window.setTimeout(() => {
+    $("#audioAnalysisStatus").hidden = true;
+  }, 550);
 }
 
 $("#referenceAudioButton").addEventListener("click", () => $("#referenceAudioPicker").click());
@@ -1213,6 +1241,7 @@ $("#referenceAudioPicker").addEventListener("change", async (event) => {
   } catch (error) {
     console.error(error);
     $("#audioMatchBadge").textContent = "处理失败";
+    $("#audioAnalysisStatus").hidden = true;
     showToast(error.message || "视频音频提取失败", 5200);
   }
 });
@@ -2034,6 +2063,7 @@ $("#previewVideo").addEventListener("seeking", () => {
 });
 $("#previewVideo").addEventListener("seeked", async () => {
   drawPreviewFrame();
+  if (state.previewScrubbing) return;
   // 视频停在新位置后，按时间线固定关系重新定位提取音轨。
   if (!$("#previewVideo").paused && state.musicEngine?.confirmed) {
     await waitForPresentedVideoFrame($("#previewVideo"));
@@ -2048,41 +2078,119 @@ $("#previewVideo").addEventListener("timeupdate", () => {
   }
   $("#previewTime").textContent = formatTime(video.currentTime);
   $("#previewScrubber").value = video.currentTime;
-  state.musicEngine?.syncPreview(video, state.trimStart).catch(() => {});
   drawPreviewFrame();
 });
 $("#previewScrubber").addEventListener("input", (event) => {
+  state.previewScrubbing = true;
+  state.musicEngine?.stopPreview();
   $("#previewVideo").currentTime = Number(event.target.value);
   $("#previewTime").textContent = formatTime(Number(event.target.value));
 });
 $("#previewScrubber").addEventListener("change", async () => {
+  state.previewScrubbing = false;
   drawPreviewFrame();
-  if (!$("#previewVideo").paused) await state.musicEngine?.syncPreview($("#previewVideo"), state.trimStart, true);
+  const video = $("#previewVideo");
+  if (!video.paused && state.musicEngine?.confirmed) {
+    await waitForPresentedVideoFrame(video);
+    if (!video.paused) await state.musicEngine.startPreview(video, state.trimStart);
+  }
 });
 
 $("#exportButton").addEventListener("click", exportLocalVideo);
 let previewAudioCapture = null;
 async function addVideoAudioToStream(video, canvasStream) {
+  // 优先用 Web Audio 把原音轨送入编码流，并通过 0 音量节点连接系统输出。
+  // 导出仍会后台解码视频，但不会让用户听到预览自动播放。
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (AudioContextClass) {
+    if (!previewAudioCapture) {
+      const context = new AudioContextClass();
+      const source = context.createMediaElementSource(video);
+      const destination = context.createMediaStreamDestination();
+      const monitorGain = context.createGain();
+      monitorGain.gain.value = 0;
+      source.connect(destination);
+      source.connect(monitorGain);
+      monitorGain.connect(context.destination);
+      previewAudioCapture = { context, source, destination, monitorGain };
+    }
+    previewAudioCapture.monitorGain.gain.value = 0;
+    await previewAudioCapture.context.resume();
+    previewAudioCapture.destination.stream.getAudioTracks().forEach((track) => canvasStream.addTrack(track));
+    return;
+  }
   const capture = video.captureStream || video.webkitCaptureStream;
   if (typeof capture === "function") {
     const sourceStream = capture.call(video);
     sourceStream.getAudioTracks().forEach((track) => canvasStream.addTrack(track));
-    return;
   }
-  // Safari 没有 HTMLVideoElement.captureStream 时，用 Web Audio 把原视频音轨送入编码流。
-  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-  if (!AudioContextClass) return;
-  if (!previewAudioCapture) {
-    const context = new AudioContextClass();
-    const source = context.createMediaElementSource(video);
-    const destination = context.createMediaStreamDestination();
-    source.connect(destination);
-    source.connect(context.destination);
-    previewAudioCapture = { context, source, destination };
-  }
-  await previewAudioCapture.context.resume();
-  previewAudioCapture.destination.stream.getAudioTracks().forEach((track) => canvasStream.addTrack(track));
 }
+
+function setExportProgress(message, percent) {
+  const value = Math.round(clamp(Number(percent) || 0, 0, 100));
+  $("#exportOverlay").hidden = false;
+  $("#exportProgressView").hidden = false;
+  $("#exportResultView").hidden = true;
+  $("#exportProgressText").textContent = message;
+  $("#exportProgressPercent").textContent = `${value}%`;
+  $("#exportProgressBar").style.width = `${value}%`;
+}
+
+function releaseExportResult() {
+  if (state.exportResultUrl) URL.revokeObjectURL(state.exportResultUrl);
+  state.exportResultUrl = "";
+  state.exportedFile = null;
+}
+
+function showExportResult(file) {
+  releaseExportResult();
+  state.exportedFile = file;
+  state.exportResultUrl = URL.createObjectURL(file);
+  $("#exportProgressView").hidden = true;
+  $("#exportResultView").hidden = false;
+  $("#exportOverlay").hidden = false;
+  $("#exportResultSize").textContent = `${(file.size / 1024 / 1024).toFixed(1)} MB`;
+  const canShareFile = Boolean(navigator.canShare?.({ files: [file] }));
+  $("#saveExportedVideo").textContent = canShareFile ? "保存到相册" : "下载视频";
+  $("#exportSaveHint").textContent = canShareFile
+    ? "点击后在 iPhone 系统菜单中选择“存储视频”"
+    : "当前浏览器不支持直接调用相册，将下载到文件";
+}
+
+function downloadExportedFile(file) {
+  const anchor = document.createElement("a");
+  anchor.href = state.exportResultUrl || URL.createObjectURL(file);
+  anchor.download = file.name;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
+
+$("#saveExportedVideo").addEventListener("click", async () => {
+  const file = state.exportedFile;
+  if (!file) return;
+  try {
+    if (navigator.canShare?.({ files: [file] })) {
+      await navigator.share({ files: [file], title: "DanceFocus 直拍视频" });
+    } else {
+      downloadExportedFile(file);
+    }
+  } catch (error) {
+    if (error?.name !== "AbortError") {
+      console.error(error);
+      downloadExportedFile(file);
+      showToast("系统分享不可用，已改为下载视频", 4200);
+    }
+  }
+});
+
+$("#downloadExportedVideo").addEventListener("click", () => {
+  if (state.exportedFile) downloadExportedFile(state.exportedFile);
+});
+
+$("#closeExportOverlay").addEventListener("click", () => {
+  if (!state.exporting) $("#exportOverlay").hidden = true;
+});
 
 async function exportLocalVideo() {
   if (state.exporting) return;
@@ -2095,6 +2203,9 @@ async function exportLocalVideo() {
   state.exporting = true;
   const button = $("#exportButton");
   button.textContent = "导出 0%";
+  button.disabled = true;
+  releaseExportResult();
+  setExportProgress("正在准备视频画面…", 0);
   try {
     state.musicEngine?.stopPreview();
     await seekVideo(video, state.trimStart);
@@ -2104,6 +2215,7 @@ async function exportLocalVideo() {
       button.textContent = "分析轮廓 0%";
       await precomputeExportMasks(video, (progress) => {
         button.textContent = `分析轮廓 ${Math.round(progress * 100)}%`;
+        setExportProgress("正在生成其他人物轮廓…", progress * 35);
       });
       await seekVideo(video, state.trimStart);
       applyCachedExportMask(state.trimStart);
@@ -2131,10 +2243,13 @@ async function exportLocalVideo() {
     video.volume = 1;
     await video.play();
     previewLoop();
+    const visualStart = state.blurOthers ? 35 : 5;
+    const visualSpan = 80 - visualStart;
     await new Promise((resolve) => {
       const timer = window.setInterval(() => {
         const percent = (video.currentTime - state.trimStart) / Math.max(.01, state.trimEnd - state.trimStart) * 100;
         button.textContent = `导出 ${Math.round(clamp(percent, 0, 100))}%`;
+        setExportProgress("正在后台生成视频画面…", visualStart + clamp(percent, 0, 100) / 100 * visualSpan);
         if (video.currentTime >= state.trimEnd - .04 || video.ended) {
           window.clearInterval(timer);
           video.pause();
@@ -2152,27 +2267,34 @@ async function exportLocalVideo() {
       blob = await state.musicEngine.muxProcessedVideo(
         intermediateBlob,
         state.trimEnd - state.trimStart,
-        (progress) => { button.textContent = `音轨合成 ${Math.round(progress * 100)}%`; },
+        (progress, message) => {
+          button.textContent = `音轨合成 ${Math.round(progress * 100)}%`;
+          setExportProgress(message || "正在合成对齐音轨…", 80 + progress * 20);
+        },
       );
       extension = "mp4";
     }
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `DanceFocus-${Date.now()}.${extension}`;
-    anchor.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 15000);
-    showToast(`已按源画面像素和高码率导出${state.musicEngine?.confirmed ? "，已使用对齐后的干净音乐" : ""}（${(blob.size / 1024 / 1024).toFixed(1)} MB）`, 5200);
+    const filename = `DanceFocus-${Date.now()}.${extension}`;
+    const file = new File([blob], filename, { type: blob.type || (extension === "mp4" ? "video/mp4" : "video/webm") });
+    setExportProgress("正在完成导出文件…", 100);
+    showExportResult(file);
+    showToast(`导出完成，请点击“保存到相册”${state.musicEngine?.confirmed ? "；音轨与预览使用同一时间线" : ""}`, 5200);
   } catch (error) {
     console.error(error);
+    $("#exportOverlay").hidden = true;
     showToast(error?.message ? `本地导出中断：${error.message}` : "本地导出中断，请保持页面在前台", 5200);
   } finally {
+    video.pause();
+    // createMediaElementSource 建立后，视频原声会长期经过这个监听节点。
+    // 导出结束恢复为 100%，否则用户返回预览后会听不到现场原声。
+    if (previewAudioCapture?.monitorGain) previewAudioCapture.monitorGain.gain.value = 1;
     state.exporting = false;
     state.exportMaskCache = [];
     state.lastPreviewCenter = null;
     drawPreviewFrame();
     if (state.musicEngine?.result) state.musicEngine.applyVideoVolume(video, state.trimStart);
     button.textContent = "导出";
+    button.disabled = false;
   }
 }
 

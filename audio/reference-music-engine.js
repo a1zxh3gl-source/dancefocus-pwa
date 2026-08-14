@@ -131,6 +131,7 @@
       this.onProgress = options.onProgress || (() => {});
       this.ffmpeg = null;
       this.ffmpegPromise = null;
+      this.ffmpegTaskProgress = null;
       this.referenceFile = null;
       this.referenceInputName = "";
       this.result = null;
@@ -190,7 +191,16 @@
         if (!global.FFmpegWASM?.FFmpeg) throw new Error("FFmpeg 引擎未加载");
         this.emit("ffmpeg", .03, "正在启动本地音频引擎…");
         const instance = new global.FFmpegWASM.FFmpeg();
-        instance.on("progress", ({ progress }) => this.emit("ffmpeg", .04 + clamp(progress || 0, 0, 1) * .16, "FFmpeg 正在本地处理音频…"));
+        instance.on("progress", ({ progress }) => {
+          const normalized = clamp(progress || 0, 0, 1);
+          if (this.ffmpegTaskProgress) {
+            this.ffmpegTaskProgress(normalized);
+            return;
+          }
+          // 只有自动对齐期间才更新配音面板。后续预览缓存或最终导出
+          // 有各自的状态 UI，不能把已完成状态重新改回 20%。
+          if (this.processing) this.emit("ffmpeg", .04 + normalized * .16, "FFmpeg 正在本地处理音频…");
+        });
         instance.on("log", ({ message }) => {
           if (/error|invalid|failed/i.test(message || "")) console.warn("FFmpeg:", message);
         });
@@ -760,7 +770,9 @@
       await this.removeFile(outputName);
       await ffmpeg.writeFile(inputName, new Uint8Array(await processedBlob.arrayBuffer()));
       onProgress(.08, "正在组装对齐后的新音轨…");
-      const music = this.musicFilter(duration, "music", "1:a");
+      // 最终文件必须和用户已经试听确认的预览使用同一条全局时间线。
+      // 局部锚点只用于诊断不连续片段，不能在导出时造成音乐回跳。
+      const music = this.musicFilter(duration, "music", "1:a", { forceGlobal: true });
       const coverage = this.audioCoverageSeconds() || { start: 0, end: 0 };
       const coverageStart = clamp(coverage.start, 0, duration);
       const coverageEnd = clamp(coverage.end, 0, duration);
@@ -778,14 +790,21 @@
         "-c:v", "copy", "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart",
         "-t", Math.max(.1, duration).toFixed(3), outputName,
       ];
-      let exitCode = await ffmpeg.exec(args);
-      if (exitCode !== 0) {
-        // 某些 Chrome 只能产生 VP8/VP9 WebM，无法直接 copy 进 MP4；此时才回退到一次兼容编码。
-        await this.removeFile(outputName);
-        const fallbackArgs = [...args];
-        const videoCodecIndex = fallbackArgs.indexOf("copy");
-        fallbackArgs.splice(videoCodecIndex, 1, "libx264", "-preset", "veryfast", "-crf", "16");
-        exitCode = await ffmpeg.exec(fallbackArgs);
+      const previousProgress = this.ffmpegTaskProgress;
+      this.ffmpegTaskProgress = (progress) => onProgress(.08 + progress * .84, "正在合成与预览一致的音轨…");
+      let exitCode;
+      try {
+        exitCode = await ffmpeg.exec(args);
+        if (exitCode !== 0) {
+          // 某些 Chrome 只能产生 VP8/VP9 WebM，无法直接 copy 进 MP4；此时才回退到一次兼容编码。
+          await this.removeFile(outputName);
+          const fallbackArgs = [...args];
+          const videoCodecIndex = fallbackArgs.indexOf("copy");
+          fallbackArgs.splice(videoCodecIndex, 1, "libx264", "-preset", "veryfast", "-crf", "16");
+          exitCode = await ffmpeg.exec(fallbackArgs);
+        }
+      } finally {
+        this.ffmpegTaskProgress = previousProgress;
       }
       if (exitCode !== 0) {
         await this.removeFile(inputName);
@@ -796,6 +815,7 @@
       const blob = new Blob([data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)], { type: "video/mp4" });
       await this.removeFile(inputName);
       await this.removeFile(outputName);
+      onProgress(1, "导出文件已生成");
       return blob;
     }
 

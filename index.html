@@ -14,7 +14,7 @@
     <link rel="manifest" href="./manifest.webmanifest?v=20260813-1" />
     <link rel="icon" type="image/png" sizes="192x192" href="./icons/icon-192.png?v=20260813-1" />
     <link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon.png?v=20260813-1" />
-    <link rel="stylesheet" href="./styles.css?v=20260813-18" />
+    <link rel="stylesheet" href="./styles.css?v=20260814-6" />
   </head>
   <body>
     <main class="app-shell" aria-live="polite">
@@ -155,15 +155,35 @@
     </main>
 
     <div class="toast" id="toast" role="status"></div>
+    <div class="export-overlay" id="exportOverlay" hidden role="dialog" aria-modal="true" aria-label="视频导出">
+      <div class="export-dialog">
+        <div id="exportProgressView">
+          <span class="export-spinner"></span>
+          <b id="exportProgressText">正在生成视频…</b>
+          <div class="export-progress-line"><i id="exportProgressBar"></i></div>
+          <strong id="exportProgressPercent">0%</strong>
+          <small>视频正在后台逐帧生成，请保持应用在前台</small>
+        </div>
+        <div id="exportResultView" hidden>
+          <span class="export-success">✓</span>
+          <b>视频导出完成</b>
+          <strong id="exportResultSize"></strong>
+          <button class="primary-button" id="saveExportedVideo">保存到相册</button>
+          <small id="exportSaveHint">点击后在系统菜单中选择“存储视频”</small>
+          <button class="secondary-button export-download-button" id="downloadExportedVideo">同时保留到文件</button>
+          <button class="export-close-button" id="closeExportOverlay">返回编辑</button>
+        </div>
+      </div>
+    </div>
     <script src="./vendor/tf.min.js?v=20260813-13"></script>
     <script src="./vendor/coco-ssd.min.js?v=20260813-13"></script>
     <script src="./vendor/ffmpeg/ffmpeg.js?v=20260813-13"></script>
     <script src="./mask-config.js?v=20260813-18"></script>
     <script src="./mask-compositor.js?v=20260813-18"></script>
     <script src="./tracking-engine.js?v=20260813-18"></script>
-    <script src="./audio/audio-alignment-core.js?v=20260814-5"></script>
-    <script src="./audio/reference-music-engine.js?v=20260814-5"></script>
-    <script src="./app.js?v=20260814-5"></script>
+    <script src="./audio/audio-alignment-core.js?v=20260814-6"></script>
+    <script src="./audio/reference-music-engine.js?v=20260814-6"></script>
+    <script src="./app.js?v=20260814-6"></script>
     <script src="./pwa.js?v=20260813-1"></script>
   </body>
 </html>

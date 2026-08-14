@@ -230,6 +230,21 @@ body { display: grid; place-items: start center; min-height: 100vh; }
 
 .toast { position: fixed; z-index: 50; left: 50%; bottom: 25px; max-width: calc(100% - 38px); padding: 12px 16px; border-radius: 15px; background: rgba(34,29,43,.97); border: 1px solid #52475f; color: white; font-size: 11px; transform: translate(-50%,20px); opacity: 0; pointer-events: none; transition: .2s; }
 .toast.show { transform: translate(-50%,0); opacity: 1; }
+.export-overlay { position: fixed; z-index: 1000; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(4,3,7,.94); backdrop-filter: blur(18px); }
+.export-overlay[hidden] { display: none; }
+.export-dialog { width: min(100%,380px); padding: 30px 24px; border: 1px solid #403653; border-radius: 28px; background: #12101a; box-shadow: 0 28px 90px #000; text-align: center; }
+#exportProgressView, #exportResultView { display: flex; flex-direction: column; align-items: center; gap: 13px; }
+#exportProgressView[hidden], #exportResultView[hidden] { display: none; }
+.export-spinner { width: 58px; height: 58px; margin-bottom: 6px; border: 4px solid #3a314b; border-top-color: var(--purple); border-radius: 50%; animation: spin .8s linear infinite; }
+.export-progress-line { width: 100%; height: 8px; overflow: hidden; border-radius: 5px; background: #302a3c; }
+.export-progress-line i { display: block; width: 0; height: 100%; border-radius: inherit; background: var(--gradient); transition: width .18s linear; }
+#exportProgressPercent { color: var(--purple); font-size: 24px; }
+.export-dialog small { color: var(--muted); font-size: 11px; line-height: 1.55; }
+.export-success { display: grid; place-items: center; width: 62px; height: 62px; border-radius: 50%; background: rgba(86,220,145,.15); color: var(--green); font-size: 32px; }
+#exportResultSize { color: var(--muted); font-size: 12px; }
+#exportResultView .primary-button { margin-top: 8px; }
+.export-download-button { margin-top: 3px; }
+.export-close-button { padding: 10px 18px; background: transparent; color: var(--muted); font-size: 12px; }
 
 @media (max-height: 760px) {
   .screen { min-height: 820px; }
