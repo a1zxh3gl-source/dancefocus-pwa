@@ -1234,7 +1234,7 @@ $("#referenceAudioPicker").addEventListener("change", async (event) => {
       duration: state.trimEnd - state.trimStart,
     });
     await renderAudioResult(result);
-    if (!$("#previewVideo").paused) await engine.startPreview($("#previewVideo"), state.trimStart);
+    if (!$("#previewVideo").paused) await ensureExtractedMusicPreview($("#previewVideo"), { notify: true });
     showToast(result.status === "matched" && result.cross_device_stable
       ? "已提取音乐并自动对齐"
       : "已提取音乐，请试听确认；需要时可拖动微调", 4600);
@@ -1253,7 +1253,7 @@ async function commitAudioTrackStart(trackStartMs) {
   await engine.setTimelineStart(clamp(trackStartMs, limits.min, limits.max));
   state.audioAlignment = engine.exportParameters();
   renderAudioTimeline();
-  if (!$("#previewVideo").paused) await engine.startPreview($("#previewVideo"), state.trimStart);
+  if (!$("#previewVideo").paused) await ensureExtractedMusicPreview($("#previewVideo"), { notify: true });
 }
 
 let audioTrackDrag = null;
@@ -1262,6 +1262,10 @@ $("#extractedAudioTrack").addEventListener("pointerdown", (event) => {
   if (!engine.result) return;
   event.preventDefault();
   engine.stopPreview();
+  if (!$("#previewVideo").paused) {
+    $("#previewVideo").muted = false;
+    $("#previewVideo").volume = 1;
+  }
   const lane = $("#audioTrackLane");
   audioTrackDrag = {
     pointerId: event.pointerId,
@@ -1309,7 +1313,16 @@ function updateAudioMixSettings() {
   engine.setMix({ mode: originalVolume > 0 ? "mix" : "replace", originalVolume, musicVolume });
   $("#originalVolumeValue").textContent = `${Math.round(originalVolume * 100)}%`;
   $("#musicVolumeValue").textContent = `${Math.round(musicVolume * 100)}%`;
-  engine.applyVideoVolume($("#previewVideo"), state.trimStart);
+  const video = $("#previewVideo");
+  if (!video.paused && engine.confirmed && !engine.previewIsScheduled()) {
+    // 提取音乐尚未真正排程时不先把原声关掉，否则滑块改成
+    // “提取音乐100% / 现场原声0%”的瞬间会出现两轨都无声。
+    video.muted = false;
+    video.volume = 1;
+    void ensureExtractedMusicPreview(video, { notify: true });
+  } else {
+    engine.applyVideoVolume(video, state.trimStart);
+  }
   state.audioAlignment = engine.exportParameters();
 }
 $("#originalVolume").addEventListener("input", updateAudioMixSettings);
@@ -2039,23 +2052,72 @@ async function waitForPresentedVideoFrame(video, timeoutMs = 420) {
   });
 }
 
+let extractedMusicStartGeneration = 0;
+let lastExtractedMusicRecoveryAt = 0;
+async function ensureExtractedMusicPreview(video, options = {}) {
+  const engine = state.musicEngine;
+  if (!engine?.confirmed || !video || video.paused) return false;
+  lastExtractedMusicRecoveryAt = performance.now();
+  const generation = ++extractedMusicStartGeneration;
+  const expectsMusicNow = engine.hasExtractedMusicAt(video.currentTime, state.trimStart);
+  let lastError = null;
+
+  const attempt = async (rebuildContext = false) => {
+    // range input 在 iPhone 上会先发 seeking，再延迟发 seeked。
+    // 等新位置稳定后再排程，避免 startPreview 刚启动就被取消。
+    for (let index = 0; index < 6 && video.seeking; index += 1) await sleep(35);
+    if (generation !== extractedMusicStartGeneration || video.paused) return engine.previewIsScheduled();
+    try {
+      if (rebuildContext) {
+        engine.markSystemAudioInterrupted();
+        await engine.resumePreviewContext();
+      }
+      const started = await engine.startPreview(video, state.trimStart);
+      return Boolean(started || engine.previewIsScheduled());
+    } catch (error) {
+      lastError = error;
+      return false;
+    }
+  };
+
+  let started = await attempt(false);
+  if (!started && generation === extractedMusicStartGeneration && !video.paused) {
+    await sleep(60);
+    started = await attempt(false);
+  }
+  if (!started && generation === extractedMusicStartGeneration && !video.paused) {
+    // 普通重试仍失败时，强制重建 iOS Web Audio 会话后再试一次。
+    started = await attempt(true);
+  }
+
+  if (generation !== extractedMusicStartGeneration) return engine.previewIsScheduled();
+  if (!started && expectsMusicNow && !video.paused) {
+    // 不允许保持“原声已静音，提取音乐却未启动”的状态。
+    video.muted = false;
+    video.volume = 1;
+    if (lastError) console.warn("提取音乐自动恢复失败", lastError);
+    if (options.notify) showToast("提取音乐未成功启动，已自动保留视频原声；请再点一次播放", 4600);
+  }
+  return started;
+}
+
 $("#previewPlay").addEventListener("click", async () => {
   const video = $("#previewVideo");
   if (video.paused) {
     // 从 iPhone 系统“存储视频”界面返回后 Web Audio 会进入 suspended。
     // 必须在这次用户点击的手势内先恢复，否则后面等首帧时会丢失播放权限。
-    let cleanAudioReady = true;
     if (state.musicEngine?.confirmed) {
       try {
         await state.musicEngine.resumePreviewContext();
       } catch (error) {
-        console.warn("系统音频会话恢复失败，先回退到视频原声", error);
-        cleanAudioReady = false;
+        console.warn("系统音频会话首次恢复失败，播放后将自动重试", error);
       }
     }
     if (video.currentTime < state.trimStart || video.currentTime >= state.trimEnd) video.currentTime = state.trimStart;
-    if (state.musicEngine?.result && cleanAudioReady) state.musicEngine.applyVideoVolume(video, state.trimStart);
-    else { video.muted = false; video.volume = 1; }
+    // 先保证原声通道可用；首帧呈现后，只有在提取音乐成功排程时
+    // startPreview 才会按用户的 0% 设置关闭原声。
+    video.muted = false;
+    video.volume = 1;
     try {
       if (state.blurOthers && !state.previewMasksReady) {
         await preparePreviewMaskTimeline();
@@ -2064,18 +2126,7 @@ $("#previewPlay").addEventListener("click", async () => {
       // iPhone 的 play() Promise 可能早于首个画面帧真正呈现。
       // 等视频时钟开始走动后再启动配乐，避免手机端音乐抢跑。
       await waitForPresentedVideoFrame(video);
-      if (!video.paused && state.musicEngine?.confirmed && cleanAudioReady) {
-        try {
-          await state.musicEngine.startPreview(video, state.trimStart);
-        } catch (error) {
-          console.warn("配乐预览恢复失败，本次播放视频原声", error);
-          video.muted = false;
-          video.volume = 1;
-          showToast("系统音频刚恢复，本次先播放视频原声，再点一次即可恢复配乐", 4200);
-        }
-      } else if (!cleanAudioReady) {
-        showToast("系统音频刚恢复，本次先播放视频原声，再点一次即可恢复配乐", 4200);
-      }
+      if (!video.paused && state.musicEngine?.confirmed) await ensureExtractedMusicPreview(video, { notify: true });
     } catch (_) { showToast("请再点一次播放"); }
   } else {
     video.pause();
@@ -2098,6 +2149,10 @@ $("#previewVideo").addEventListener("pause", () => {
 $("#previewVideo").addEventListener("seeking", () => {
   // 拖动视频时立即停止旧的音乐源，避免它继续播放拖动前的位置。
   state.musicEngine?.stopPreview();
+  if (!$("#previewVideo").paused) {
+    $("#previewVideo").muted = false;
+    $("#previewVideo").volume = 1;
+  }
 });
 $("#previewVideo").addEventListener("seeked", async () => {
   drawPreviewFrame();
@@ -2105,7 +2160,7 @@ $("#previewVideo").addEventListener("seeked", async () => {
   // 视频停在新位置后，按时间线固定关系重新定位提取音轨。
   if (!$("#previewVideo").paused && state.musicEngine?.confirmed) {
     await waitForPresentedVideoFrame($("#previewVideo"));
-    if (!$("#previewVideo").paused) await state.musicEngine.startPreview($("#previewVideo"), state.trimStart);
+    if (!$("#previewVideo").paused) await ensureExtractedMusicPreview($("#previewVideo"), { notify: true });
   }
 });
 $("#previewVideo").addEventListener("timeupdate", () => {
@@ -2116,11 +2171,29 @@ $("#previewVideo").addEventListener("timeupdate", () => {
   }
   $("#previewTime").textContent = formatTime(video.currentTime);
   $("#previewScrubber").value = video.currentTime;
+  if (
+    state.musicEngine?.confirmed
+    && state.musicEngine.hasExtractedMusicAt(video.currentTime, state.trimStart)
+    && !state.musicEngine.previewIsScheduled()
+    && !video.paused
+    && !video.seeking
+    && performance.now() - lastExtractedMusicRecoveryAt > 900
+  ) {
+    // iOS 偶尔会在播放中途丢失 AudioBufferSource。时间轴看门狗先
+    // 恢复原声防止静音，同时自动重新排程提取音乐。
+    video.muted = false;
+    video.volume = 1;
+    void ensureExtractedMusicPreview(video, { notify: false });
+  }
   drawPreviewFrame();
 });
 $("#previewScrubber").addEventListener("input", (event) => {
   state.previewScrubbing = true;
   state.musicEngine?.stopPreview();
+  if (!$("#previewVideo").paused) {
+    $("#previewVideo").muted = false;
+    $("#previewVideo").volume = 1;
+  }
   $("#previewVideo").currentTime = Number(event.target.value);
   $("#previewTime").textContent = formatTime(Number(event.target.value));
 });
@@ -2130,7 +2203,7 @@ $("#previewScrubber").addEventListener("change", async () => {
   const video = $("#previewVideo");
   if (!video.paused && state.musicEngine?.confirmed) {
     await waitForPresentedVideoFrame(video);
-    if (!video.paused) await state.musicEngine.startPreview(video, state.trimStart);
+    if (!video.paused) await ensureExtractedMusicPreview(video, { notify: true });
   }
 });
 

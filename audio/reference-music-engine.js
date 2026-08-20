@@ -670,6 +670,16 @@
       return { start, end: start + duration };
     }
 
+    hasExtractedMusicAt(videoTime, trimStart = 0) {
+      const coverage = this.audioCoverageSeconds();
+      const relativeTime = Math.max(0, safeNumber(videoTime) - Math.max(0, safeNumber(trimStart)));
+      return Boolean(coverage && relativeTime >= coverage.start && relativeTime < coverage.end);
+    }
+
+    previewIsScheduled() {
+      return Boolean(this.previewSource && this.audioContext?.state === "running");
+    }
+
     applyVideoVolume(video, trimStart = 0) {
       if (!video) return;
       if (!this.result) {
@@ -677,31 +687,38 @@
         video.volume = 1;
         return;
       }
-      const coverage = this.audioCoverageSeconds();
-      const relativeTime = Math.max(0, safeNumber(video.currentTime) - Math.max(0, safeNumber(trimStart)));
-      const hasExtractedMusic = coverage && relativeTime >= coverage.start && relativeTime < coverage.end;
+      const hasExtractedMusic = this.hasExtractedMusicAt(video.currentTime, trimStart);
       if (!hasExtractedMusic) {
         // 提取音轨尚未开始或已结束：使用视频原声，不留静音空白。
         video.muted = false;
         video.volume = 1;
-        return;
+        return true;
+      }
+      if (!video.paused && !this.previewIsScheduled()) {
+        // 不能只因为当前时间落在提取音乐区间，就先把视频原声关掉。
+        // iPhone 上 seeked/页面恢复可能中断音乐源启动；若源尚未真正
+        // 排程，先保留原声作为安全网，避免“两轨都没声”。
+        video.muted = false;
+        video.volume = 1;
+        return false;
       }
       // 提取音轨覆盖区间：默认只播放提取音乐；用户调高原声时则按滑块比例混合。
       video.muted = this.originalVolume <= 0;
       video.volume = clamp(this.originalVolume, 0, 1);
+      return true;
     }
 
     async startPreview(video, trimStart) {
       if (!this.alignedPreviewBuffer) {
         this.applyVideoVolume(video, trimStart);
-        return;
+        return false;
       }
       const requestId = ++this.previewRequestId;
       this.stopPreview(false);
       await this.resumePreviewContext();
       // seeked、play 与手动拖动在 iPhone 上可能同时触发。旧的异步启动
       // 不得覆盖最新的视频位置，否则会听到错位或双音轨。
-      if (requestId !== this.previewRequestId || video.paused || video.seeking) return;
+      if (requestId !== this.previewRequestId || video.paused || video.seeking) return false;
       const relativeTime = Math.max(0, video.currentTime - trimStart);
       const speed = safeNumber(this.result?.speed_ratio, 1);
       // 音轨是固定在视频时间线上的片段：
@@ -714,8 +731,9 @@
       if (musicTime >= this.alignedPreviewBuffer.duration) {
         this.previewStartedAt = this.audioContext.currentTime;
         this.previewVideoTime = relativeTime;
-        this.applyVideoVolume(video, trimStart);
-        return;
+        video.muted = false;
+        video.volume = 1;
+        return false;
       }
       const source = this.audioContext.createBufferSource();
       const gain = this.audioContext.createGain();
@@ -763,6 +781,7 @@
         this.previewBoundaryTimer = null;
         this.applyVideoVolume(video, trimStart);
       };
+      return true;
     }
 
     stopPreview(invalidatePending = true) {
